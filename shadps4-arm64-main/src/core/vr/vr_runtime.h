@@ -71,6 +71,46 @@ struct PadFeedback {
     bool operator==(const PadFeedback&) const = default;
 };
 
+/// The two PlayStation Move wands, played with the headset's own controllers
+/// (SHADPS4_QUEST_MOVE=1). Wand 0 is the first the title opens: the right hand. Wand 1 is the left.
+constexpr int NumMoveWands = 2;
+
+/// Buttons of a Move wand, as libSceMove reports them (the layout of the PS3's libgem, which
+/// libSceMove kept).
+namespace MoveButtons {
+constexpr u16 Select = 1u << 0;
+constexpr u16 T = 1u << 1;
+constexpr u16 Move = 1u << 2;
+constexpr u16 Start = 1u << 3;
+constexpr u16 Triangle = 1u << 4;
+constexpr u16 Circle = 1u << 5;
+constexpr u16 Cross = 1u << 6;
+constexpr u16 Square = 1u << 7;
+} // namespace MoveButtons
+
+/// What a wand's buttons and trigger say, from the host.
+struct MoveInput {
+    u16 buttons{};
+    u8 trigger{}; ///< 0 released to 255 fully pulled.
+};
+
+/// How the headset's controllers are turned into wands. The values are those the launcher
+/// recommends; SHADPS4_QUEST_MOVE_PITCH (degrees), SHADPS4_QUEST_MOVE_SCALE and
+/// SHADPS4_QUEST_MOVE_TURN (fractions) replace them.
+struct MoveConfig {
+    bool enabled{false};
+    /// How far the wand is raised above the way the controller's grip points. A Touch
+    /// controller's handle is tilted down from where the hand points.
+    float pitch_degrees{35.0f};
+    /// How far the wand moves when the hand does, measured from the head (1 = as far).
+    float reach{0.55f};
+    /// How far the wand turns when the hand does, measured from level and facing where the
+    /// head faces (1 = as far).
+    float turn{0.65f};
+    /// The sphere a Move is tracked by sits at the end of the wand, ahead of the hand.
+    float sphere_ahead{0.06f};
+};
+
 /// Everything the host needs to put one emulated HMD frame in front of the user's eyes.
 struct PresentedFrame {
     u32 id{};         ///< Matches the marker the presenter stamps into the frame.
@@ -215,9 +255,30 @@ public:
     /// tells of its refreshes, as often as Config::refresh_rate says otherwise.
     float HeadsetRefreshRate() const;
 
+    // The Move wands (see MoveConfig). Host side: where the controller of that hand is and what
+    // its buttons say, in host space; LoseMove when the host no longer sees it.
+    const MoveConfig& GetMoveConfig() const {
+        return move_config;
+    }
+    bool MoveWandsEnabled() const {
+        return move_config.enabled;
+    }
+    void UpdateMove(int wand, const DeviceState& host_state, const MoveInput& input);
+    void UpdateMoveInput(int wand, const MoveInput& input);
+    void LoseMove(int wand);
+    /// What the title wants a wand to do: its rumble (0 to 255) and the colour of its sphere.
+    void SetMoveVibration(int wand, u8 intensity);
+    u8 GetMoveVibration(int wand) const;
+    void SetMoveLight(int wand, u8 red, u8 green, u8 blue);
+
     // Guest side, tracker space.
     DeviceState GetHead();
     DeviceState GetPad();
+    /// A wand's place and how it is turned, as the title is to see it (MoveConfig applied).
+    /// `tracked` is false until the host has seen that controller, and once it has been out of
+    /// sight for a moment (the wand then stays where it was last seen).
+    DeviceState GetMove(int wand);
+    MoveInput GetMoveInput(int wand) const;
 
     /// Converts a tracker-space pose handed back by the guest into host space.
     Pose ToHostSpace(const Pose& tracker_pose) const;
@@ -295,6 +356,18 @@ private:
     std::condition_variable headset_fov_known;
     Fov headset_fov;
     bool has_headset_fov{};
+    // The Move wands, guarded by `mutex`.
+    struct MoveWand {
+        DeviceState host; ///< As the host last gave it, host space.
+        MoveInput input;
+        bool seen{};  ///< Ever.
+        bool lost{};  ///< Out of the host's sight since it was last seen.
+        std::chrono::steady_clock::time_point seen_time;
+        u8 vibration{};
+        u8 light[3]{};
+    };
+    MoveConfig move_config;
+    MoveWand move_wands[NumMoveWands];
     PadFeedback pad_feedback;
     std::function<void(const PadFeedback&)> pad_feedback_listener;
     std::function<void(const PresentedFrame&)> frame_listener;

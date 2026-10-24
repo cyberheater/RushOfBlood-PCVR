@@ -9,7 +9,9 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <initializer_list>
 #include <mutex>
+#include <optional>
 #include <thread>
 
 #include <windows.h>
@@ -355,6 +357,24 @@ struct OpenXrHost::Impl {
     XrSpace grip_spaces[2]{XR_NULL_HANDLE, XR_NULL_HANDLE};
     bool actions_ready{};
     bool actions_synced{};
+    // With SHADPS4_QUEST_MOVE=1 the controllers are also the title's two Move wands: their
+    // buttons are read too, and the title's rumble goes to them.
+    bool move_wands{};
+    XrAction act_trigger{XR_NULL_HANDLE};
+    XrAction act_squeeze{XR_NULL_HANDLE};
+    XrAction act_lower{XR_NULL_HANDLE};   ///< A on the right, X on the left.
+    XrAction act_upper{XR_NULL_HANDLE};   ///< B on the right, Y on the left.
+    XrAction act_stick_click{XR_NULL_HANDLE};
+    XrAction act_stick{XR_NULL_HANDLE};
+    XrAction act_menu{XR_NULL_HANDLE};    ///< The left controller's only.
+    XrAction act_haptic{XR_NULL_HANDLE};
+    bool move_wand_seen[2]{};
+    u8 move_rumble_sent[2]{};
+    Clock::time_point move_rumble_time[2]{};
+    bool menu_down{};
+    bool menu_fired{};
+    Clock::time_point menu_since{};
+    Clock::time_point start_until{};
     XrVector3f grip_rest{};
     Clock::time_point grip_moved{};
     // What the gamepad is placed by: 0 nothing, 1 the joints of the hands, 2 the above.
@@ -683,10 +703,11 @@ struct OpenXrHost::Impl {
             DestroySession();
             return false;
         }
-        if (has_hand_tracking) {
+        // (Move wands are the controllers themselves: the hands around a gamepad mean nothing.)
+        if (has_hand_tracking && !move_wands) {
             CreateHandTrackers();
         }
-        if (use_grips) {
+        if (use_grips || move_wands) {
             CreateActions();
         }
         if (has_refresh_rate) {
@@ -733,8 +754,44 @@ struct OpenXrHost::Impl {
         }
     }
 
+    /// The buttons, sticks and rumble of the headset's controllers, for the Move wands. All in
+    /// the action set CreateActions makes, for both hands.
+    bool CreateMoveActions() {
+        const auto make = [&](XrAction& action, const char* name, const char* localized,
+                              XrActionType type) {
+            XrActionCreateInfo info{XR_TYPE_ACTION_CREATE_INFO};
+            std::strcpy(info.actionName, name);
+            std::strcpy(info.localizedActionName, localized);
+            info.actionType = type;
+            info.countSubactionPaths = 2;
+            info.subactionPaths = hand_paths;
+            if (XR_FAILED(xrCreateAction(action_set, &info, &action))) {
+                action = XR_NULL_HANDLE;
+                LOG_WARNING(Core_Vr, "The controllers' {} could not be asked for", localized);
+                return false;
+            }
+            return true;
+        };
+        bool made = true;
+        made &= make(act_trigger, "move_t", "Move T (trigger)", XR_ACTION_TYPE_FLOAT_INPUT);
+        made &= make(act_squeeze, "move_move", "Move MOVE button (grip)",
+                     XR_ACTION_TYPE_FLOAT_INPUT);
+        made &= make(act_lower, "move_cross", "Move cross (A/X)", XR_ACTION_TYPE_BOOLEAN_INPUT);
+        made &= make(act_upper, "move_circle", "Move circle (B/Y)", XR_ACTION_TYPE_BOOLEAN_INPUT);
+        made &= make(act_stick_click, "move_square", "Move square (stick click)",
+                     XR_ACTION_TYPE_BOOLEAN_INPUT);
+        made &= make(act_stick, "move_stick", "Move triangle and select (stick up and down)",
+                     XR_ACTION_TYPE_VECTOR2F_INPUT);
+        made &= make(act_menu, "move_start", "Move START (menu)", XR_ACTION_TYPE_BOOLEAN_INPUT);
+        made &= make(act_haptic, "move_rumble", "Move rumble", XR_ACTION_TYPE_VIBRATION_OUTPUT);
+        if (!made) {
+            LOG_WARNING(Core_Vr, "The Move wands get no buttons: the controllers only place them");
+        }
+        return made;
+    }
+
     /// Lets the headset's runtime say where its controllers are, for LocateGrip. (They are not
-    /// the title's gamepad: nothing of what they do is read.)
+    /// the title's gamepad: nothing of what they do is read, unless they are its Move wands.)
     void CreateActions() {
         actions_ready = false;
         XrActionSetCreateInfo set_info{XR_TYPE_ACTION_SET_CREATE_INFO};
@@ -766,6 +823,23 @@ struct OpenXrHost::Impl {
         };
         bind(act_grip, "/user/hand/left/input/grip/pose");
         bind(act_grip, "/user/hand/right/input/grip/pose");
+        if (move_wands && CreateMoveActions()) {
+            bind(act_trigger, "/user/hand/left/input/trigger/value");
+            bind(act_trigger, "/user/hand/right/input/trigger/value");
+            bind(act_squeeze, "/user/hand/left/input/squeeze/value");
+            bind(act_squeeze, "/user/hand/right/input/squeeze/value");
+            bind(act_lower, "/user/hand/left/input/x/click");
+            bind(act_lower, "/user/hand/right/input/a/click");
+            bind(act_upper, "/user/hand/left/input/y/click");
+            bind(act_upper, "/user/hand/right/input/b/click");
+            bind(act_stick_click, "/user/hand/left/input/thumbstick/click");
+            bind(act_stick_click, "/user/hand/right/input/thumbstick/click");
+            bind(act_stick, "/user/hand/left/input/thumbstick");
+            bind(act_stick, "/user/hand/right/input/thumbstick");
+            bind(act_menu, "/user/hand/left/input/menu/click");
+            bind(act_haptic, "/user/hand/left/output/haptic");
+            bind(act_haptic, "/user/hand/right/output/haptic");
+        }
         XrInteractionProfileSuggestedBinding suggested{
             XR_TYPE_INTERACTION_PROFILE_SUGGESTED_BINDING};
         xrStringToPath(instance, "/interaction_profiles/oculus/touch_controller",
@@ -898,6 +972,19 @@ struct OpenXrHost::Impl {
             xrDestroyActionSet(action_set);
             action_set = XR_NULL_HANDLE;
         }
+        for (XrAction* action : {&act_trigger, &act_squeeze, &act_lower, &act_upper,
+                                 &act_stick_click, &act_stick, &act_menu, &act_haptic}) {
+            *action = XR_NULL_HANDLE;
+        }
+        for (int wand = 0; wand < 2; ++wand) {
+            if (move_wand_seen[wand]) {
+                Runtime::Instance().LoseMove(wand);
+            }
+            move_wand_seen[wand] = false;
+            move_rumble_sent[wand] = 0;
+        }
+        menu_down = false;
+        menu_fired = false;
         if (local_space != XR_NULL_HANDLE) {
             xrDestroySpace(local_space);
             local_space = XR_NULL_HANDLE;
@@ -1176,7 +1263,11 @@ struct OpenXrHost::Impl {
                 static_cast<XrTime>(std::clamp(predict_ms, 0.0f, 80.0f) * 1e6f);
             UpdateHead(pose_time);
             SyncActions();
-            UpdatePad(pose_time);
+            if (move_wands) {
+                UpdateMoves(pose_time);
+            } else {
+                UpdatePad(pose_time);
+            }
 
             if (const s32 index = TakeFrame(); index >= 0) {
                 const auto started = Clock::now();
@@ -1502,6 +1593,189 @@ struct OpenXrHost::Impl {
             LOG_INFO(Core_Vr, "The gamepad is placed in the game by where the hands are, which {}",
                      source == 1 ? "the headset tracks"
                                  : "its runtime tells by the places of its own controllers");
+        }
+    }
+
+    // ---- The Move wands --------------------------------------------------------------------
+
+    float ReadFloat(XrAction action, int hand) {
+        if (action == XR_NULL_HANDLE) {
+            return 0.0f;
+        }
+        XrActionStateGetInfo get{XR_TYPE_ACTION_STATE_GET_INFO};
+        get.action = action;
+        get.subactionPath = hand_paths[hand];
+        XrActionStateFloat state{XR_TYPE_ACTION_STATE_FLOAT};
+        if (XR_FAILED(xrGetActionStateFloat(session, &get, &state)) ||
+            state.isActive != XR_TRUE) {
+            return 0.0f;
+        }
+        return state.currentState;
+    }
+
+    bool ReadBool(XrAction action, int hand) {
+        if (action == XR_NULL_HANDLE) {
+            return false;
+        }
+        XrActionStateGetInfo get{XR_TYPE_ACTION_STATE_GET_INFO};
+        get.action = action;
+        get.subactionPath = hand_paths[hand];
+        XrActionStateBoolean state{XR_TYPE_ACTION_STATE_BOOLEAN};
+        if (XR_FAILED(xrGetActionStateBoolean(session, &get, &state)) ||
+            state.isActive != XR_TRUE) {
+            return false;
+        }
+        return state.currentState == XR_TRUE;
+    }
+
+    XrVector2f ReadStick(int hand) {
+        if (act_stick == XR_NULL_HANDLE) {
+            return {};
+        }
+        XrActionStateGetInfo get{XR_TYPE_ACTION_STATE_GET_INFO};
+        get.action = act_stick;
+        get.subactionPath = hand_paths[hand];
+        XrActionStateVector2f state{XR_TYPE_ACTION_STATE_VECTOR2F};
+        if (XR_FAILED(xrGetActionStateVector2f(session, &get, &state)) ||
+            state.isActive != XR_TRUE) {
+            return {};
+        }
+        return state.currentState;
+    }
+
+    /// Where the controller of a hand is, how it is turned and how it moves, in host space.
+    std::optional<DeviceState> LocateGripPose(int hand, XrTime time) {
+        if (grip_spaces[hand] == XR_NULL_HANDLE) {
+            return std::nullopt;
+        }
+        XrActionStateGetInfo get{XR_TYPE_ACTION_STATE_GET_INFO};
+        get.action = act_grip;
+        get.subactionPath = hand_paths[hand];
+        XrActionStatePose pose{XR_TYPE_ACTION_STATE_POSE};
+        if (XR_FAILED(xrGetActionStatePose(session, &get, &pose)) || pose.isActive != XR_TRUE) {
+            return std::nullopt;
+        }
+        XrSpaceVelocity velocity{XR_TYPE_SPACE_VELOCITY};
+        XrSpaceLocation location{XR_TYPE_SPACE_LOCATION};
+        location.next = &velocity;
+        static constexpr XrSpaceLocationFlags Needed =
+            XR_SPACE_LOCATION_POSITION_VALID_BIT | XR_SPACE_LOCATION_ORIENTATION_VALID_BIT |
+            XR_SPACE_LOCATION_POSITION_TRACKED_BIT;
+        if (XR_FAILED(xrLocateSpace(grip_spaces[hand], local_space, time, &location)) ||
+            (location.locationFlags & Needed) != Needed) {
+            return std::nullopt;
+        }
+        DeviceState state;
+        state.pose.position = {location.pose.position.x, location.pose.position.y,
+                               location.pose.position.z};
+        state.pose.orientation =
+            Normalize({location.pose.orientation.x, location.pose.orientation.y,
+                       location.pose.orientation.z, location.pose.orientation.w});
+        if ((velocity.velocityFlags & XR_SPACE_VELOCITY_LINEAR_VALID_BIT) != 0) {
+            state.linear_velocity = {velocity.linearVelocity.x, velocity.linearVelocity.y,
+                                     velocity.linearVelocity.z};
+        }
+        if ((velocity.velocityFlags & XR_SPACE_VELOCITY_ANGULAR_VALID_BIT) != 0) {
+            state.angular_velocity = {velocity.angularVelocity.x, velocity.angularVelocity.y,
+                                      velocity.angularVelocity.z};
+        }
+        state.tracked = true;
+        return state;
+    }
+
+    /// The right controller is the first wand, the left the second. Trigger = T, grip = MOVE,
+    /// A/X = cross, B/Y = circle, stick click = square, stick up = triangle, stick down =
+    /// select, the left menu button = START when tapped (held for a second it resets the view).
+    void UpdateMoves(XrTime time) {
+        auto& runtime = Runtime::Instance();
+        const auto now = Clock::now();
+        // The menu button is START when it is let go of within a second, and resets the view
+        // when it is held longer (the title then sees no START, so its pause menu stays shut).
+        const bool menu = actions_synced && ReadBool(act_menu, 0);
+        if (menu && !menu_down) {
+            menu_since = now;
+            menu_fired = false;
+        }
+        if (menu && !menu_fired && now - menu_since > std::chrono::seconds{1}) {
+            menu_fired = true;
+            LOG_INFO(Core_Vr, "Menu button held: the view is reset");
+            runtime.RequestRecenter();
+        }
+        if (!menu && menu_down && !menu_fired) {
+            start_until = now + std::chrono::milliseconds{120};
+        }
+        menu_down = menu;
+        const bool start = now < start_until;
+
+        for (int wand = 0; wand < 2; ++wand) {
+            const int hand = wand == 0 ? 1 : 0;
+            MoveInput input;
+            if (actions_synced) {
+                namespace B = MoveButtons;
+                const float trigger = std::clamp(ReadFloat(act_trigger, hand), 0.0f, 1.0f);
+                input.trigger = static_cast<u8>(std::lround(trigger * 255.0f));
+                const XrVector2f stick = ReadStick(hand);
+                const auto press = [&](bool pressed, u16 button) {
+                    if (pressed) {
+                        input.buttons |= button;
+                    }
+                };
+                // (The console's T reads as pressed a little before the trigger bottoms out.)
+                press(trigger > 0.85f, B::T);
+                press(ReadFloat(act_squeeze, hand) > 0.5f, B::Move);
+                press(ReadBool(act_lower, hand), B::Cross);
+                press(ReadBool(act_upper, hand), B::Circle);
+                press(ReadBool(act_stick_click, hand), B::Square);
+                press(stick.y > 0.7f, B::Triangle);
+                press(stick.y < -0.7f, B::Select);
+                press(start, B::Start);
+            }
+
+            const std::optional<DeviceState> pose =
+                actions_synced ? LocateGripPose(hand, time) : std::nullopt;
+            if (pose) {
+                runtime.UpdateMove(wand, *pose, input);
+                if (!move_wand_seen[wand]) {
+                    LOG_INFO(Core_Vr, "Move wand {} is the {} controller", wand + 1,
+                             hand == 1 ? "right" : "left");
+                }
+                move_wand_seen[wand] = true;
+            } else {
+                if (move_wand_seen[wand]) {
+                    LOG_INFO(Core_Vr, "Move wand {} ({} controller) is out of sight", wand + 1,
+                             hand == 1 ? "right" : "left");
+                    runtime.LoseMove(wand);
+                }
+                move_wand_seen[wand] = false;
+                // Buttons still count while the controller cannot be seen.
+                if (actions_synced) {
+                    runtime.UpdateMoveInput(wand, input);
+                }
+            }
+
+            // The title's rumble. A Move's motor keeps going until told otherwise; a haptic
+            // pulse ends by itself, so it is renewed while the title wants it.
+            const u8 rumble = runtime.GetMoveVibration(wand);
+            if (act_haptic == XR_NULL_HANDLE || !actions_synced) {
+                continue;
+            }
+            XrHapticActionInfo haptic_info{XR_TYPE_HAPTIC_ACTION_INFO};
+            haptic_info.action = act_haptic;
+            haptic_info.subactionPath = hand_paths[hand];
+            if (rumble > 0 && (rumble != move_rumble_sent[wand] ||
+                               now - move_rumble_time[wand] > std::chrono::milliseconds{60})) {
+                XrHapticVibration vibration{XR_TYPE_HAPTIC_VIBRATION};
+                vibration.amplitude = static_cast<float>(rumble) / 255.0f;
+                vibration.duration = 100'000'000; // 100 ms, renewed before it runs out.
+                vibration.frequency = XR_FREQUENCY_UNSPECIFIED;
+                xrApplyHapticFeedback(session, &haptic_info,
+                                      reinterpret_cast<const XrHapticBaseHeader*>(&vibration));
+                move_rumble_sent[wand] = rumble;
+                move_rumble_time[wand] = now;
+            } else if (rumble == 0 && move_rumble_sent[wand] != 0) {
+                xrStopHapticFeedback(session, &haptic_info);
+                move_rumble_sent[wand] = 0;
+            }
         }
     }
 
@@ -2050,6 +2324,7 @@ bool OpenXrHost::Connect() {
     impl->predict_ms = EnvFloat("SHADPS4_XR_PREDICT_MS", 20.0f);
     impl->lose_after = EnvFloat("SHADPS4_XR_LOSE_AFTER", 0.0f);
     impl->pause_when_away = EnvFlag("SHADPS4_XR_PAUSE", true);
+    impl->move_wands = Runtime::Instance().MoveWandsEnabled();
     if (const char* unwanted = std::getenv("SHADPS4_XR_UNWANTED"); unwanted != nullptr) {
         std::sscanf(unwanted, "%f,%f", &impl->unwanted_from, &impl->unwanted_to);
     }

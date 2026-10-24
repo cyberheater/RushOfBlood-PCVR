@@ -193,7 +193,32 @@ FileConfig LoadFileConfig() {
 
 } // namespace
 
-Runtime::Runtime() = default;
+Runtime::Runtime() {
+    // The Move wands are asked for by libSceMove as the title starts, before Configure: they
+    // are set up from the environment the launcher gives the emulator, here.
+    bool flag = false;
+    move_config.enabled = EnvFlag("SHADPS4_QUEST_MOVE", flag) && flag;
+    const auto env_float = [](const char* name, float fallback, float low, float high) {
+        const char* value = std::getenv(name);
+        if (value == nullptr || *value == '\0') {
+            return fallback;
+        }
+        return std::clamp(static_cast<float>(std::atof(value)), low, high);
+    };
+    move_config.pitch_degrees =
+        env_float("SHADPS4_QUEST_MOVE_PITCH", move_config.pitch_degrees, -90.0f, 90.0f);
+    move_config.reach = env_float("SHADPS4_QUEST_MOVE_SCALE", move_config.reach, 0.05f, 1.5f);
+    move_config.turn = env_float("SHADPS4_QUEST_MOVE_TURN", move_config.turn, 0.05f, 1.5f);
+    move_config.sphere_ahead =
+        env_float("SHADPS4_QUEST_MOVE_SPHERE", move_config.sphere_ahead, 0.0f, 0.3f);
+    if (move_config.enabled) {
+        LOG_INFO(Core_Vr,
+                 "Move wands from the headset's controllers: aim raised {:.0f} degrees, reach "
+                 "{:.0f}%, turning {:.0f}%, sphere {:.0f} mm ahead of the hand",
+                 move_config.pitch_degrees, move_config.reach * 100.0f, move_config.turn * 100.0f,
+                 move_config.sphere_ahead * 1000.0f);
+    }
+}
 
 Runtime& Runtime::Instance() {
     static Runtime instance;
@@ -868,6 +893,134 @@ DeviceState Runtime::GetPad() {
     }
     state.sequence = pad.sequence;
     state.tracked = true;
+    return state;
+}
+
+void Runtime::UpdateMove(int wand, const DeviceState& host_state, const MoveInput& input) {
+    if (wand < 0 || wand >= NumMoveWands) {
+        return;
+    }
+    std::scoped_lock lock{mutex};
+    MoveWand& w = move_wands[wand];
+    const u64 sequence = w.host.sequence + 1;
+    w.host = host_state;
+    w.host.sequence = sequence;
+    w.host.tracked = true;
+    w.input = input;
+    w.seen = true;
+    w.lost = false;
+    w.seen_time = std::chrono::steady_clock::now();
+}
+
+void Runtime::UpdateMoveInput(int wand, const MoveInput& input) {
+    if (wand < 0 || wand >= NumMoveWands) {
+        return;
+    }
+    std::scoped_lock lock{mutex};
+    move_wands[wand].input = input;
+}
+
+void Runtime::LoseMove(int wand) {
+    if (wand < 0 || wand >= NumMoveWands) {
+        return;
+    }
+    std::scoped_lock lock{mutex};
+    // It stays where it was last seen (as a Move out of the camera's sight does), and lets go
+    // of its buttons.
+    move_wands[wand].input = {};
+    move_wands[wand].lost = true;
+    move_wands[wand].host.linear_velocity = {};
+    move_wands[wand].host.angular_velocity = {};
+}
+
+void Runtime::SetMoveVibration(int wand, u8 intensity) {
+    if (wand < 0 || wand >= NumMoveWands) {
+        return;
+    }
+    std::scoped_lock lock{mutex};
+    move_wands[wand].vibration = intensity;
+}
+
+u8 Runtime::GetMoveVibration(int wand) const {
+    if (wand < 0 || wand >= NumMoveWands) {
+        return 0;
+    }
+    std::scoped_lock lock{mutex};
+    return move_wands[wand].vibration;
+}
+
+void Runtime::SetMoveLight(int wand, u8 red, u8 green, u8 blue) {
+    if (wand < 0 || wand >= NumMoveWands) {
+        return;
+    }
+    std::scoped_lock lock{mutex};
+    move_wands[wand].light[0] = red;
+    move_wands[wand].light[1] = green;
+    move_wands[wand].light[2] = blue;
+}
+
+MoveInput Runtime::GetMoveInput(int wand) const {
+    if (wand < 0 || wand >= NumMoveWands) {
+        return {};
+    }
+    std::scoped_lock lock{mutex};
+    return move_wands[wand].input;
+}
+
+DeviceState Runtime::GetMove(int wand) {
+    DeviceState state;
+    if (wand < 0 || wand >= NumMoveWands) {
+        return state;
+    }
+    std::scoped_lock lock{mutex};
+    const MoveWand& w = move_wands[wand];
+    if (!w.seen) {
+        return state;
+    }
+
+    // Into tracker space, as the controller is.
+    const Vec3 grip = PositionToTracker(w.host.pose.position);
+    Quat orientation = Normalize(Multiply(Conjugate(seat_yaw), w.host.pose.orientation));
+
+    // A Touch controller's grip points along the handle, which leans forward from where the
+    // hand aims: the wand is raised by that much, about its own sideways axis.
+    const float pitch = move_config.pitch_degrees * 3.14159265f / 180.0f;
+    orientation = Normalize(Multiply(orientation, FromAxisAngle({1.0f, 0.0f, 0.0f}, pitch)));
+
+    const DeviceState& current_head = head.sequence == 0 ? DemoHead() : head;
+
+    // Turning, scaled about "level and facing the way the head faces".
+    const Quat facing = YawOnly(current_head.pose.orientation);
+    Quat relative = Normalize(Multiply(Conjugate(facing), orientation));
+    if (relative.w < 0.0f) {
+        relative = {-relative.x, -relative.y, -relative.z, -relative.w};
+    }
+    const float half = std::acos(std::clamp(relative.w, -1.0f, 1.0f));
+    const float sin_half = std::sin(half);
+    if (sin_half > 1e-5f) {
+        const Vec3 axis{relative.x / sin_half, relative.y / sin_half, relative.z / sin_half};
+        relative = FromAxisAngle(axis, 2.0f * half * move_config.turn);
+    }
+    orientation = Normalize(Multiply(facing, relative));
+
+    // Reach, scaled about the head; the sphere the console tracks sits at the far end of the
+    // wand, ahead of the hand the way the wand now points.
+    const Vec3& from = current_head.pose.position;
+    const Vec3 ahead = Rotate(orientation, {0.0f, 0.0f, -move_config.sphere_ahead});
+    state.pose.position = {from.x + (grip.x - from.x) * move_config.reach + ahead.x,
+                           from.y + (grip.y - from.y) * move_config.reach + ahead.y,
+                           from.z + (grip.z - from.z) * move_config.reach + ahead.z};
+    state.pose.orientation = orientation;
+    const Vec3 velocity = DirectionToTracker(w.host.linear_velocity);
+    state.linear_velocity = {velocity.x * move_config.reach, velocity.y * move_config.reach,
+                             velocity.z * move_config.reach};
+    const Vec3 spin = DirectionToTracker(w.host.angular_velocity);
+    state.angular_velocity = {spin.x * move_config.turn, spin.y * move_config.turn,
+                              spin.z * move_config.turn};
+    state.sequence = w.host.sequence;
+    // Sight of a controller comes and goes for a frame or two: only a longer loss counts.
+    state.tracked = !w.lost || std::chrono::steady_clock::now() - w.seen_time <
+                                   std::chrono::milliseconds{300};
     return state;
 }
 

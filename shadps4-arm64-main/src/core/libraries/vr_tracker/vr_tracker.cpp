@@ -18,6 +18,7 @@
 #include "common/logging/log.h"
 #include "core/libraries/error_codes.h"
 #include "core/libraries/kernel/time.h"
+#include "core/libraries/move/move.h"
 #include "core/libraries/libs.h"
 #include "core/libraries/vr_tracker/vr_tracker.h"
 #include "core/known_title.h"
@@ -48,7 +49,9 @@ struct PadRegistration {
 };
 static std::vector<PadRegistration> g_pads;
 static std::mutex g_pads_mutex;
-static s32 g_move_handle = -1;
+// The Move wands registered, in the order they were (guarded by g_pads_mutex). One, as before,
+// unless the headset's controllers play as two (SHADPS4_QUEST_MOVE=1).
+static std::vector<s32> g_move_handles;
 static s32 g_gun_handle = -1;
 static s32 g_hmd_handle = -1;
 
@@ -67,6 +70,22 @@ static std::optional<PadRegistration> FindPad(s32 handle) {
 static bool IsPlayersPad(s32 handle) {
     std::scoped_lock lock{g_pads_mutex};
     return !g_pads.empty() && g_pads.front().handle == handle;
+}
+
+static bool IsMove(s32 handle) {
+    std::scoped_lock lock{g_pads_mutex};
+    return std::ranges::find(g_move_handles, handle) != g_move_handles.end();
+}
+
+/// The wand a registered Move handle stands for: as libSceMove opened it, or else by the order
+/// of registration.
+static int MoveWandOf(s32 handle) {
+    if (const int wand = Libraries::Move::WandForHandle(handle); wand >= 0) {
+        return wand;
+    }
+    std::scoped_lock lock{g_pads_mutex};
+    const auto it = std::ranges::find(g_move_handles, handle);
+    return it == g_move_handles.end() ? -1 : static_cast<int>(it - g_move_handles.begin());
 }
 
 static bool HeadsetConnected() {
@@ -379,10 +398,15 @@ s32 PS4_SYSV_ABI sceVrTrackerRegisterDeviceInternal(const OrbisVrTrackerDeviceTy
         break;
     }
     case OrbisVrTrackerDeviceType::ORBIS_VR_TRACKER_DEVICE_MOVE: {
-        if (g_move_handle != -1) {
+        const size_t most =
+            Core::Vr::Runtime::Instance().MoveWandsEnabled() ? Core::Vr::NumMoveWands : 1;
+        std::scoped_lock lock{g_pads_mutex};
+        if (std::ranges::find(g_move_handles, handle) != g_move_handles.end() ||
+            g_move_handles.size() >= most) {
             return ORBIS_VR_TRACKER_ERROR_DEVICE_ALREADY_REGISTERED;
         }
-        g_move_handle = handle;
+        g_move_handles.push_back(handle);
+        LOG_INFO(Lib_VrTracker, "Move wand registered, handle {:#x}", handle);
         break;
     }
     case OrbisVrTrackerDeviceType::ORBIS_VR_TRACKER_DEVICE_GUN: {
@@ -431,7 +455,13 @@ s32 PS4_SYSV_ABI sceVrTrackerGetResult(const OrbisVrTrackerGetResultParam* param
     const auto pad_registration = FindPad(handle);
     // (Another player's controller is registered, but nothing tracks it.)
     const bool is_pad = pad_registration.has_value() && IsPlayersPad(handle);
-    if (!is_hmd && !pad_registration && handle != g_move_handle && handle != g_gun_handle) {
+    const bool is_move = !is_hmd && !pad_registration && IsMove(handle);
+    const int move_wand = is_move ? MoveWandOf(handle) : -1;
+    auto& runtime = Core::Vr::Runtime::Instance();
+    // A Move is tracked once the controller playing it has been seen.
+    const bool move_tracked =
+        is_move && move_wand >= 0 && runtime.MoveWandsEnabled() && runtime.GetMove(move_wand).tracked;
+    if (!is_hmd && !pad_registration && !is_move && handle != g_gun_handle) {
         return ORBIS_VR_TRACKER_ERROR_DEVICE_NOT_REGISTERED;
     }
 
@@ -441,7 +471,7 @@ s32 PS4_SYSV_ABI sceVrTrackerGetResult(const OrbisVrTrackerGetResultParam* param
     result->camera_orientation_w = 1.0f;
 
     // Only the headset and the first controller are tracked by the host.
-    if (!HeadsetConnected() || (!is_hmd && !is_pad)) {
+    if (!HeadsetConnected() || (!is_hmd && !is_pad && !move_tracked)) {
         // DIAGNOSTIC (Rush of Blood, forced pause menu): say which device is reported as lost,
         // and why. Logged the first 8 times per device, then every 2000th.
         static std::mutex lost_mutex;
@@ -456,7 +486,7 @@ s32 PS4_SYSV_ABI sceVrTrackerGetResult(const OrbisVrTrackerGetResultParam* param
                             handle, n,
                             is_hmd                   ? "headset"
                             : pad_registration       ? (is_pad ? "players pad" : "other pad")
-                            : handle == g_move_handle ? "Move"
+                            : is_move                 ? "Move"
                                                       : "gun",
                             HeadsetConnected());
             }
@@ -465,8 +495,9 @@ s32 PS4_SYSV_ABI sceVrTrackerGetResult(const OrbisVrTrackerGetResultParam* param
         return ORBIS_OK;
     }
 
-    auto& runtime = Core::Vr::Runtime::Instance();
-    Core::Vr::DeviceState state = is_hmd ? runtime.GetHead() : runtime.GetPad();
+    Core::Vr::DeviceState state = is_hmd    ? runtime.GetHead()
+                                  : is_move ? runtime.GetMove(move_wand)
+                                            : runtime.GetPad();
     if (is_hmd) {
         // DIAGNOSTIC (Rush of Blood, broken level geometry): feed the game a fixed head pose.
         //   SHADPS4_HEAD_POSE=identity  -> position 0, no rotation
@@ -505,8 +536,11 @@ s32 PS4_SYSV_ABI sceVrTrackerGetResult(const OrbisVrTrackerGetResultParam* param
         OrbisVrTrackerRecalibrateNecessityType::ORBIS_VR_TRACKER_RECALIBRATE_NECESSITY_NOTHING;
     result->playarea_brightness_risk =
         OrbisVrTrackerPlayareaBrightnessRiskType::ORBIS_VR_TRACKER_PLAYAREA_BRIGHTNESS_RISK_LOW;
-    result->led_color = is_pad ? pad_registration->color
-                               : OrbisVrTrackerLedColor::ORBIS_VR_TRACKER_LED_COLOR_BLUE;
+    result->led_color = is_pad    ? pad_registration->color
+                        : is_move ? (move_wand == 0
+                                         ? OrbisVrTrackerLedColor::ORBIS_VR_TRACKER_LED_COLOR_BLUE
+                                         : OrbisVrTrackerLedColor::ORBIS_VR_TRACKER_LED_COLOR_RED)
+                                  : OrbisVrTrackerLedColor::ORBIS_VR_TRACKER_LED_COLOR_BLUE;
     result->status = OrbisVrTrackerStatus::ORBIS_VR_TRACKER_STATUS_TRACKING;
     result->position_quality = OrbisVrTrackerQuality::ORBIS_VR_TRACKER_QUALITY_FULL;
     result->orientation_quality = OrbisVrTrackerQuality::ORBIS_VR_TRACKER_QUALITY_FULL;
@@ -519,6 +553,10 @@ s32 PS4_SYSV_ABI sceVrTrackerGetResult(const OrbisVrTrackerGetResultParam* param
 
     if (is_pad) {
         WritePose(result->pad_info.device_pose, state.pose);
+        return ORBIS_OK;
+    }
+    if (is_move) {
+        WritePose(result->move_info.device_pose, state.pose);
         return ORBIS_OK;
     }
 
@@ -643,7 +681,8 @@ s32 PS4_SYSV_ABI sceVrTrackerRecalibrate(const OrbisVrTrackerRecalibrateParam* p
         break;
     }
     case OrbisVrTrackerDeviceType::ORBIS_VR_TRACKER_DEVICE_MOVE: {
-        if (g_move_handle == -1) {
+        std::scoped_lock lock{g_pads_mutex};
+        if (g_move_handles.empty()) {
             return ORBIS_VR_TRACKER_ERROR_DEVICE_NOT_REGISTERED;
         }
         break;
@@ -809,8 +848,9 @@ s32 PS4_SYSV_ABI sceVrTrackerUnregisterDevice(const s32 handle) {
         // (The next registered, if any, is the player's from now on.)
         std::scoped_lock lock{g_pads_mutex};
         std::erase_if(g_pads, [&](const PadRegistration& pad) { return pad.handle == handle; });
-    } else if (handle == g_move_handle) {
-        g_move_handle = -1;
+    } else if (IsMove(handle)) {
+        std::scoped_lock lock{g_pads_mutex};
+        std::erase(g_move_handles, handle);
     } else if (handle == g_gun_handle) {
         g_gun_handle = -1;
     } else {

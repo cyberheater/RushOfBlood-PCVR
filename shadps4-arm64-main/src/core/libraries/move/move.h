@@ -43,5 +43,8 @@ struct OrbisMoveData {
     float temperature;
 };
 
+/// The Move wand (0 or 1) an open handle stands for, or -1 for none (for libSceVrTracker).
+int WandForHandle(s32 handle);
+
 void RegisterLib(Core::Loader::SymbolsResolver* sym);
 } // namespace Libraries::Move

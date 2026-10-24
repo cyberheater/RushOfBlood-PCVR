@@ -29,11 +29,7 @@ function Need([string]$path, [string]$what) {
     if (-not (Test-Path -LiteralPath $path)) { throw "Missing ${what}: $path" }
 }
 Need $Exe "emulator (build it first, see the top of this script)"
-# The free emulator must not have the Motion (paid) Quest/Move code in it: the build folder holds
-# the paid exe after a paid build. Build from main again, or pass the free exe with -Exe.
-if ([Text.Encoding]::GetEncoding(28591).GetString([IO.File]::ReadAllBytes($Exe)).Contains("SHADPS4_QUEST_MOVE")) {
-    throw "$Exe has the paid Quest/Move code in it (it was built on the paid-build branch). Build the free emulator from main: git checkout main, then cmake --build shadps4-arm64-main\Build\x64-Clang-Release --target shadps4 (or give the free exe with -Exe)."
-}
+# (This fork has its own Quest/Move support built in, so its emulator carries SHADPS4_QUEST_MOVE.)
 foreach ($name in "PkgTool.exe", "LibOrbisPkg.dll", "LICENSE.txt") {
     Need (Join-Path $PkgToolDir $name) "PkgTool file (see the top of this script)"
 }

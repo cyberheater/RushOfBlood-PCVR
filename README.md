@@ -83,6 +83,41 @@ See [CHANGELOG.md](CHANGELOG.md) for what changed in each version.
 Your saves, settings and the log are in `pc-vr\user` next to the launcher: the log is
 `pc-vr\user\log\shad_log.txt`, the saves are in `pc-vr\user\home`.
 
+## Move controllers (this fork)
+
+This fork adds the Quest controllers as the game's two **PlayStation Move wands**, written from
+scratch on the free source (it is not the author's paid Motion edition, and contains none of it).
+It is **untested on real hardware so far**: expect to tune it.
+
+1. In the start-up window, turn on **Quest controllers as Move wands** (or set
+   `controllers=quest` in `pc-vr\settings.txt`).
+2. **Unplug the DualSense** (or switch it off): while one is connected the game uses it instead.
+3. In Virtual Desktop, make sure the **controllers** (not hand tracking) are what the PC sees.
+4. In the game's start-up question choose the **Move controllers**.
+
+| Quest controller | Move wand |
+| --- | --- |
+| Right controller / left controller | First wand / second wand |
+| Trigger | T (analog) |
+| Grip | MOVE button |
+| A or X | Cross |
+| B or Y | Circle |
+| Stick click | Square |
+| Stick up / down | Triangle / Select |
+| Left menu button | START when tapped; held one second it resets the view instead |
+
+The three sliders under the switch change how the guns follow your hands: **Aim angle**
+(`move_pitch`, degrees the gun is raised above the controller's handle), **Reach** (`move_reach`,
+how far the in-game hands move compared with yours, measured from your head) and **Turning**
+(`move_turn`, how far the guns turn compared with your wrists). If the guns point low, raise the
+aim angle; if they feel sluggish or too far from your hands, raise reach and turning towards 100.
+`env=SHADPS4_QUEST_MOVE_SPHERE=0.06` sets how far ahead of the hand the tracked sphere sits, in
+metres.
+
+What to send when reporting a problem: `pc-vr\user\log\shad_log.txt`. The lines that matter
+start with `Lib_Move`, `Lib_VrTracker` and `Core_Vr` ("Move wand 1 is the right controller", "Move
+wand registered", any "NOT TRACKING" line about a Move).
+
 ## Settings
 
 Settings are in `pc-vr\settings.txt`, one `key=value` a line (the small window at start-up changes

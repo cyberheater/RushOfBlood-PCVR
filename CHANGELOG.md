@@ -3,6 +3,24 @@
 All notable changes to RushVR, newest first. RushVR is shadPS4 plus a VR layer and the fixes that
 let Until Dawn: Rush of Blood run under emulation.
 
+## Move controllers fork (based on 0.4.1) - unreleased
+
+An open implementation of the Quest controllers as the game's two PlayStation Move wands, written
+from scratch on top of the free 0.4.1 source (not the paid Motion edition). Untested on hardware
+yet: please report what you find, with `pc-vr\user\log\shad_log.txt`.
+
+- **libSceMove implemented** (`src/core/libraries/move/move.cpp`): with `SHADPS4_QUEST_MOVE=1`
+  (`controllers=quest`) two wands open, report as connected, and give the title their buttons,
+  analog trigger and motion sensors; their rumble goes to the Quest controllers.
+- **Two Move wands tracked** (`libSceVrTracker`): both register, and each is placed by its
+  controller's grip pose, raised by `move_pitch`, its sphere put 6 cm ahead of the hand
+  (`SHADPS4_QUEST_MOVE_SPHERE` in metres), its reach scaled about the head (`move_reach`) and its
+  turning scaled about level-and-facing-ahead (`move_turn`).
+- **Quest controller input** (`src/core/vr/openxr_host.cpp`): right controller = first wand, left =
+  second. Trigger = T, grip = MOVE, A/X = cross, B/Y = circle, stick click = square, stick up =
+  triangle, stick down = select, left menu = START when tapped (held a second it resets the view instead, with no START).
+- **Launcher**: the Controllers card is always on (the fork's emulator has the support built in).
+
 ## 0.4.1 - 2026-10-22
 
 The new start-up window and a fix for streaks of colour in level 2. (The paid Motion edition keeps

@@ -48,37 +48,10 @@ function Save-Setting([string]$key, [string]$value) {
 }
 Read-Settings
 
-# The Motion edition (the one with the Quest controllers playing as PlayStation Move wands) has a
-# file "license.dat" next to this launcher, signed by the maker (ECDSA P-256; this launcher holds
-# only the public key). Without a valid one the choice of controllers below stays switched off: the
-# emulator of the free edition has no Move support in it, and the Motion emulator checks the same
-# file itself. Changing the text of the file breaks the signature.
-$licensePublicKey = "ce24b402a7cf69a13d6db787f873722ccb6302432069fc63ad7e0470cf3dfc41e3d2d62d23684aa3df447db9c9fc53364e7fb428d65d830a8d9cbad7d0b27592"
-function Test-MotionEdition {
-    try {
-        if ($licensePublicKey -notmatch '^[0-9a-fA-F]{128}$') { return $false }
-        $path = Join-Path $here "license.dat"
-        if (-not (Test-Path -LiteralPath $path)) { return $false }
-        $lines = @([IO.File]::ReadAllLines($path) | ForEach-Object { $_.Trim() } | Where-Object { $_ -ne "" })
-        if ($lines.Count -lt 3) { return $false }
-        $last = $lines[$lines.Count - 1]
-        if (-not $last.StartsWith("signature=")) { return $false }
-        $body = @($lines[0..($lines.Count - 2)])
-        if ($body[0] -ne "RushVR-Motion-License-1" -or ($body -notcontains "edition=motion")) { return $false }
-        $payload = [Text.Encoding]::UTF8.GetBytes(($body -join "`n"))
-        $signature = [Convert]::FromBase64String($last.Substring(10))
-        # A BCRYPT_ECCKEY_BLOB: the magic "ECS1" (ECDSA public P-256), the key size 32, X and Y.
-        $blob = New-Object byte[] 72
-        [BitConverter]::GetBytes([uint32]0x31534345).CopyTo($blob, 0)
-        [BitConverter]::GetBytes([uint32]32).CopyTo($blob, 4)
-        for ($i = 0; $i -lt 64; $i++) { $blob[8 + $i] = [Convert]::ToByte($licensePublicKey.Substring($i * 2, 2), 16) }
-        $cng = [Security.Cryptography.CngKey]::Import($blob, [Security.Cryptography.CngKeyBlobFormat]::EccPublicBlob)
-        $ecdsa = New-Object Security.Cryptography.ECDsaCng($cng)
-        return [bool]$ecdsa.VerifyData($payload, $signature, [Security.Cryptography.HashAlgorithmName]::SHA256)
-    } catch {}
-    return $false
-}
-$motionEdition = Test-MotionEdition
+# This fork's emulator plays the Quest controllers as the game's two PlayStation Move wands
+# itself (src/core/libraries/move, src/core/vr), so the choice of controllers below is always
+# offered. ($motionEdition keeps its old name so the rest of the launcher reads as upstream.)
+$motionEdition = $true
 # The version shown in the window's banner (the release scripts check that it is the release's).
 $launcherVersion = "0.4.1"
 
@@ -1780,8 +1753,8 @@ function Show-MenuModern {
         # The banner: name, edition, version, and the minimize and close buttons.
         $header = New-Object RushUi.Header
         $header.SetBounds(1, 1, 734, 84)
-        $header.Badge = $(if ($motionEdition) { "MOTION" } else { "FREE" })
-        $header.BadgeSolid = $motionEdition
+        $header.Badge = "MOVE"
+        $header.BadgeSolid = $false
         $header.Version = $launcherVersion
         $form.Controls.Add($header)
         $minimizeButton = New-Object RushUi.CaptionButton
@@ -1994,7 +1967,7 @@ function Show-MenuModern {
         foreach ($c in $windowCard.Controls) { $c.Visible = $false }
         $tips.SetToolTip($windowCard, "Click to show or hide what the window on the PC shows.")
 
-        # Row 5: controllers, the DualSense or the Quest controllers playing as Move wands (Motion edition).
+        # Row 5: controllers, the DualSense or the Quest controllers playing as Move wands.
         $moveHeight = $(if ($motionEdition) { 108 } else { 46 })
         $moveCard = New-Card "Controllers" 24 480 688 $moveHeight
         $form.Controls.Add($moveCard)
@@ -2004,7 +1977,7 @@ function Show-MenuModern {
         $moveOn.Checked = ($motionEdition -and ((Setting "controllers" "dualsense") -eq "quest"))
         $moveOn.Enabled = $motionEdition
         $moveCard.Controls.Add($moveOn)
-        $tips.SetToolTip($moveOn, "Plays with the Quest controllers, as the game's two PlayStation Move wands, instead of the DualSense. In the game's start-up question choose the Move controllers. Unplug the DualSense first: the game uses it instead when it is connected. Motion edition only.")
+        $tips.SetToolTip($moveOn, "Plays with the Quest controllers, as the game's two PlayStation Move wands, instead of the DualSense. In the game's start-up question choose the Move controllers. Unplug the DualSense first: the game uses it instead when it is connected.")
         $moveDefaults = @(35, 55, 65)
         $moveKeys = @("move_pitch", "move_reach", "move_turn")
         $moveTitles = @("Aim angle", "Reach", "Turning")
@@ -2259,7 +2232,7 @@ $pcZoom = 100.0
 if ([double]::TryParse((Setting "pc_zoom" "100"), [System.Globalization.NumberStyles]::Float, [System.Globalization.CultureInfo]::InvariantCulture, [ref]$pcZoom) -and $pcZoom -ne 100.0) {
     $env:SHADPS4_PC_WINDOW_ZOOM = ([math]::Max(30.0, [math]::Min(200.0, $pcZoom)) / 100.0).ToString([System.Globalization.CultureInfo]::InvariantCulture)
 }
-# Motion edition: the Quest controllers play as Move wands when "controllers=quest" (the window sets
+# The Quest controllers play as Move wands when "controllers=quest" (the window sets
 # it); move_pitch is in degrees, move_reach and move_turn in percent. What is not set is left to the
 # emulator's own recommended values.
 Remove-Item -Path Env:SHADPS4_QUEST_MOVE -ErrorAction SilentlyContinue
@@ -2417,7 +2390,7 @@ if ($env:SHADPS4_QUEST_MOVE -eq "1") {
     Say "In the game's start-up question choose the Move controllers, then press the grip button"
     Say "(the MOVE button) on the controller you hold. Right hand = the first wand."
     Say "Trigger = T, grip = MOVE, A/X = cross, B/Y = circle, stick click = square,"
-    Say "stick up = triangle, stick down = select, left menu = start (hold it for a second to reset the view)."
+    Say "stick up = triangle, stick down = select, left menu = start (hold it for a second to reset the view instead)."
 } else {
     Say "The DualSense: connect it to THIS PC (USB cable, or Bluetooth paired with the PC). Paired with"
     Say "the headset, it reaches the PC through Virtual Desktop without motion sensors or touchpad."
