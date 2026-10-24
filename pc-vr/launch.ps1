@@ -53,7 +53,7 @@ Read-Settings
 # offered. ($motionEdition keeps its old name so the rest of the launcher reads as upstream.)
 $motionEdition = $true
 # The version shown in the window's banner (the release scripts check that it is the release's).
-$launcherVersion = "0.4.1"
+$launcherVersion = "0.5.0"
 
 # PS4 Pro mode ("neo_mode" in user\config.json): the emulator then tells the game it runs on a
 # PlayStation 4 Pro, which gives sharper textures. The emulator reads it as it starts.

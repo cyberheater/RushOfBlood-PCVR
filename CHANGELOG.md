@@ -3,11 +3,31 @@
 All notable changes to RushVR, newest first. RushVR is shadPS4 plus a VR layer and the fixes that
 let Until Dawn: Rush of Blood run under emulation.
 
-## Move controllers fork (based on 0.4.1) - unreleased
+## 0.5.0 - 2026-10-24
+
+The Quest controllers as the game's two PlayStation Move wands, a performance trace, a black
+level control, and new defaults, tested on a Quest 3 through Virtual Desktop with an RTX 5070.
+
+- **Aim angle below zero** (`move_pitch`, -90 to 90 in the start-up window): a Quest controller's
+  grip leans up from where you point, so the guns pointed straight up with turning at 100%. The
+  recommended values are now an aim of **-55 degrees**, reach and turning at **100%**.
+- **Black point and gamma for the headset picture** (`black=`, `gamma=` in `pc-vr\settings.txt`,
+  `SHADPS4_VR_BLACK`, `SHADPS4_VR_GAMMA`): for blacks that look grey. The default is `black=0.05`.
+- **Performance trace** (`perf_trace=1`): `perf_frames.csv` (each frame's time, the game's and the
+  GPU thread's CPU time, GPU time from timestamps, waits, shader and pipeline compiles) and
+  `perf_headset.csv` (each headset refresh: new frame or repeated) in `pc-vr\user\log`, summed up
+  by `tools\perf-report.py`. The GPU thread's CPU time is now measured on Windows too.
+- **New defaults**: eye width 2304 (Medium), field of view 100, layer scale 50, FXAA 0.65,
+  sharpening 0.3, mask 0.9, 16x anisotropic filtering, the Quest controllers as Move wands.
+- **Known problems**: eye width 2880 (High) crashes after a few minutes in this build; stay on
+  Medium. The pipeline cache (`pipeline_cache_enabled`) must stay off: it saves pointers that are
+  stale in the next run, and the emulator crashes at start.
+
+### Quest controllers as Move wands
 
 An open implementation of the Quest controllers as the game's two PlayStation Move wands, written
-from scratch on top of the free 0.4.1 source (not the paid Motion edition). Untested on hardware
-yet: please report what you find, with `pc-vr\user\log\shad_log.txt`.
+from scratch on top of the free 0.4.1 source (not the paid Motion edition). Played through the
+hub on a Quest 3; please report what you find, with `pc-vr\user\log\shad_log.txt`.
 
 - **libSceMove implemented** (`src/core/libraries/move/move.cpp`): with `SHADPS4_QUEST_MOVE=1`
   (`controllers=quest`) two wands open, report as connected, and give the title their buttons,
