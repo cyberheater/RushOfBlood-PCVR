@@ -80,7 +80,7 @@ def find_folder(argument):
 
 # Column -> what it is, for the breakdown.
 PARTS = [
-    ("submit_ms", "game building the frame (its own CPU work, up to handing it over)"),
+    ("submit_ms", "first command of a frame until the game hands it over (its CPU work AND its pacing waits)"),
     ("catchup_ms", "GPU thread still translating after the hand-over"),
     ("gputhread_cpu_ms", "CPU time of the emulator's GPU thread (translating PS4 commands)"),
     ("gpu_ms", "GPU time of the game's work (and the VR post-processing)"),
@@ -185,6 +185,7 @@ def report_frames(rows, env, skip, worst):
               f"GPU thread {mean([r.get('gputhread_cpu_ms', 0) for r in frames]):.1f}, "
               f"game {mean([r.get('submit_ms', 0) for r in frames]):.1f} ms a frame")
     return {"budget": budget, "median": median, "averages": averages,
+            "gputhread_p95": percentile([r.get("gputhread_cpu_ms", 0) for r in body], 0.95),
             "long": len(long_frames), "frames": len(body), "compiles": compiles + pipelines,
             "fps": len(body) / duration, "target": target}
 
@@ -245,23 +246,40 @@ def verdict(frames, headset):
         notes.append(f"Emulator-CPU-bound: the GPU thread spends {a['gputhread_cpu_ms']:.1f} ms a frame "
                      "translating the game's commands. Resolution settings will not help; this "
                      "needs work in the emulator (or a faster CPU).")
-    if a.get("submit_ms", 0) > 0.75 * budget:
-        notes.append(f"Game-CPU-bound: the game takes {a['submit_ms']:.1f} ms to build a frame. "
-                     "Resolution settings will not help.")
+    # submit_ms also holds the game's own waits for pacing, so it is only telling when the frame
+    # rate falls short while neither the GPU nor the GPU thread is anywhere near the budget.
+    if (frames["fps"] < 0.92 * (frames["target"] or 60.0) and a.get("submit_ms", 0) > budget
+            and gpu < 0.6 * budget and a.get("gputhread_cpu_ms", 0) < 0.6 * budget):
+        notes.append(f"Possibly game-CPU-bound: the frame rate falls short while the GPU and the "
+                     f"GPU thread have room, and the game takes {a['submit_ms']:.1f} ms to hand a "
+                     "frame over. Resolution settings will not help.")
+    gt95 = frames.get("gputhread_p95", 0)
+    if a.get("gputhread_cpu_ms", 0) <= 0.75 * budget and gt95 > 0.85 * budget:
+        notes.append(f"The GPU thread is the limit in the busy scenes: {a['gputhread_cpu_ms']:.1f} ms "
+                     f"a frame on average but {gt95:.1f} ms in the busiest 5%, at the "
+                     f"{budget:.1f} ms budget. The dips there come from translating the game's "
+                     "commands; resolution settings will not help them.")
     if a.get("wait_result_ms", 0) > 0.2 * budget:
         notes.append(f"The emulator waits {a['wait_result_ms']:.1f} ms a frame for GPU results "
                      "(readbacks): CPU and GPU take turns instead of working together.")
     if frames["compiles"] > 0 and frames["long"] > 0:
-        notes.append(f"{frames['compiles']:.0f} shaders/pipelines were compiled during play: if the "
-                     "hitches above are mostly compiles, turn on the pipeline cache "
-                     "(pipeline_cache_enabled in user\\config.json) so later runs reuse them.")
+        notes.append(f"{frames['compiles']:.0f} shaders/pipelines were compiled during play; the "
+                     "hitches marked as compiles above come from them. (This fork's pipeline "
+                     "cache is not safe to turn on yet: it saves pointers that are stale in the "
+                     "next run and crashes at start.)")
     if headset is not None and headset["hz"] > 0:
         fps = frames["fps"]
         ratio = headset["hz"] / max(fps, 1.0)
-        if headset["uneven"] > 0.1 or abs(ratio - round(ratio)) > 0.15:
-            notes.append(f"Judder: about {fps:.0f} fps on a {headset['hz']:.0f} Hz display is "
-                         f"{ratio:.2f} refreshes a frame. Use a refresh rate that is a whole "
+        target = frames["target"] or fps
+        steps = headset["hz"] / max(target, 1.0)
+        if abs(steps - round(steps)) > 0.1:
+            notes.append(f"Judder: a {target:.0f} fps target on a {headset['hz']:.0f} Hz display is "
+                         f"{steps:.2f} refreshes a frame. Use a refresh rate that is a whole "
                          "multiple of the frame rate (120 Hz for 60 fps, 90 Hz for 45).")
+        elif headset["uneven"] > 0.1:
+            notes.append(f"Some judder: {100 * headset['uneven']:.0f}% of frames were held for an "
+                         "uneven number of refreshes. The refresh rate suits the target, so these "
+                         "are frames that missed their refresh: the dips above.")
     busiest = max(gpu, a.get("gputhread_cpu_ms", 0), a.get("submit_ms", 0))
     if not any(n.endswith("bound") or "-bound:" in n for n in notes) and busiest < 0.6 * budget:
         notes.append(f"Headroom: the busiest part (GPU {gpu:.1f}, GPU thread "
