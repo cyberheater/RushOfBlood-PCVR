@@ -19,6 +19,7 @@
 #include "common/assert.h"
 #include "common/debug.h"
 #include "common/logging/log.h"
+#include "common/perf_trace.h"
 #include "common/thread.h"
 #include "core/guest_cpu/guest_wait_trace.h"
 #include "imgui/renderer/texture_manager.h"
@@ -164,7 +165,8 @@ const char* FileName(const char* path) {
 } // namespace
 
 bool FrameStats::Enabled() {
-    return FrameStatsLevel() > 0;
+    // The per-frame trace (SHADPS4_PERF_TRACE) takes its figures from the same places.
+    return FrameStatsLevel() > 0 || Common::PerfTrace::Enabled();
 }
 
 void FrameStats::RenderPass(const RenderState& state) {
@@ -199,6 +201,7 @@ void FrameStats::RenderPass(const RenderState& state) {
     }
 
     const bool has_targets = record.color_view != 0 || record.depth;
+    Common::PerfTrace::Add(Common::PerfTrace::Count::Passes);
     g_frame_counters.passes.Add();
     g_frame_counters.loading_passes.Add(record.loaded_colors != 0 || record.depth_loaded ? 1 : 0);
     // A pass without targets is as large as a framebuffer may be, and costs nothing.
@@ -228,6 +231,7 @@ void FrameStats::Draw() {
     if (!Enabled()) {
         return;
     }
+    Common::PerfTrace::Add(Common::PerfTrace::Count::Draws);
     g_frame_counters.draws.Add();
     if (FrameStatsLevel() > 1) {
         std::scoped_lock lock{g_frame_listing.mutex};
@@ -243,7 +247,8 @@ std::map<u64, u64> g_viewport_sizes; // (width << 32 | height) -> draws
 } // namespace
 
 void FrameStats::Viewport(u32 width, u32 height) {
-    if (!Enabled()) {
+    // (Only for the log's listing: a lock and a map for every draw is not for the trace.)
+    if (FrameStatsLevel() <= 0) {
         return;
     }
     std::scoped_lock lock{g_viewport_mutex};
@@ -252,12 +257,14 @@ void FrameStats::Viewport(u32 width, u32 height) {
 
 void FrameStats::Compute() {
     if (Enabled()) {
+        Common::PerfTrace::Add(Common::PerfTrace::Count::Dispatches);
         g_frame_counters.computes.Add();
     }
 }
 
 void FrameStats::Submit() {
     if (Enabled()) {
+        Common::PerfTrace::Add(Common::PerfTrace::Count::Submits);
         g_frame_counters.submits.Add();
     }
 }
@@ -266,6 +273,10 @@ void FrameStats::Time(Stage stage, std::chrono::nanoseconds time) {
     if (Enabled() && time.count() >= 0) {
         g_stage_times.total[static_cast<size_t>(stage)] += static_cast<u64>(time.count());
         ++g_stage_times.count[static_cast<size_t>(stage)];
+        // The stages are the first columns of the trace, in the same order.
+        static_assert(static_cast<u32>(Stage::Latency) ==
+                      static_cast<u32>(Common::PerfTrace::Time::Latency));
+        Common::PerfTrace::Add(static_cast<Common::PerfTrace::Time>(stage), time);
     }
 }
 
@@ -317,7 +328,7 @@ float FrameStats::TakeGpuLoad() {
 
 std::chrono::nanoseconds FrameStats::ThreadTime() {
 #ifdef _WIN32
-    return std::chrono::nanoseconds{0};
+    return Common::PerfTrace::ThreadCpuTime();
 #else
     timespec time{};
     clock_gettime(CLOCK_THREAD_CPUTIME_ID, &time);
@@ -327,6 +338,11 @@ std::chrono::nanoseconds FrameStats::ThreadTime() {
 
 void FrameStats::EndFrame() {
     if (!Enabled()) {
+        return;
+    }
+    Common::PerfTrace::EndFrame();
+    if (FrameStatsLevel() <= 0) {
+        // Only the trace is on: the log's averages are not wanted.
         return;
     }
     auto& c = g_frame_counters;
@@ -464,6 +480,7 @@ Scheduler::Scheduler(const Instance& instance)
 #if TRACY_GPU_ENABLED
     profiler_scope = reinterpret_cast<tracy::VkCtxScope*>(std::malloc(sizeof(tracy::VkCtxScope)));
 #endif
+    CreateGpuTimer();
     AllocateWorkerCommandBuffers();
     priority_pending_ops_thread =
         std::jthread(std::bind_front(&Scheduler::PriorityPendingOpsThread, this));
@@ -473,6 +490,9 @@ Scheduler::~Scheduler() {
 #if TRACY_GPU_ENABLED
     std::free(profiler_scope);
 #endif
+    if (gpu_timer.pool) {
+        instance.GetDevice().destroyQueryPool(gpu_timer.pool);
+    }
 }
 
 /// Whether a pass begun with `current` can take a draw that asks for `next`: the same targets in
@@ -617,11 +637,11 @@ void Scheduler::Wait(u64 tick) {
         Flush(info);
     }
     if (timed) {
-        g_wait_times.explicit_ns += static_cast<u64>(
-            std::chrono::duration_cast<std::chrono::nanoseconds>(
-                std::chrono::steady_clock::now() - wait_start)
-                .count());
+        const auto waited = std::chrono::duration_cast<std::chrono::nanoseconds>(
+            std::chrono::steady_clock::now() - wait_start);
+        g_wait_times.explicit_ns += static_cast<u64>(waited.count());
         ++g_wait_times.explicit_count;
+        Common::PerfTrace::Add(Common::PerfTrace::Time::WaitResult, waited);
     }
 }
 
@@ -642,6 +662,7 @@ void Scheduler::AllocateWorkerCommandBuffers() {
 
     current_cmdbuf = command_pool.Commit();
     Check(current_cmdbuf.begin(begin_info));
+    StartGpuTimer();
 
     // Invalidate dynamic state so it gets applied to the new command buffer.
     dynamic_state.Invalidate();
@@ -655,6 +676,90 @@ void Scheduler::AllocateWorkerCommandBuffers() {
         new (profiler_scope) tracy::VkCtxScope{profiler_ctx, &scope_loc, current_cmdbuf, true};
     }
 #endif
+}
+
+void Scheduler::CreateGpuTimer() {
+    if (!Common::PerfTrace::Enabled()) {
+        return;
+    }
+    const auto families = instance.GetPhysicalDevice().getQueueFamilyProperties();
+    const u32 family = instance.GetGraphicsQueueFamilyIndex();
+    const u32 bits = family < families.size() ? families[family].timestampValidBits : 0;
+    if (bits == 0) {
+        LOG_WARNING(Render_Vulkan, "Performance trace: this GPU's queue has no timestamps, "
+                                   "GPU times are left out");
+        return;
+    }
+    const auto created = instance.GetDevice().createQueryPool(vk::QueryPoolCreateInfo{
+        .queryType = vk::QueryType::eTimestamp,
+        .queryCount = GpuTimerSlots * 2,
+    });
+    if (created.result != vk::Result::eSuccess) {
+        LOG_WARNING(Render_Vulkan, "Performance trace: no timestamp query pool ({}), GPU times "
+                                   "are left out",
+                    vk::to_string(created.result));
+        return;
+    }
+    gpu_timer.pool = created.value;
+    gpu_timer.ns_per_tick = static_cast<double>(instance.TimestampPeriod());
+    gpu_timer.valid_mask = bits >= 64 ? ~u64{0} : (u64{1} << bits) - 1;
+}
+
+void Scheduler::StartGpuTimer() {
+    if (!gpu_timer.pool) {
+        return;
+    }
+    // The ring is long enough for the oldest pair to be long finished by the time it comes
+    // round again (at most MAX_IN_FLIGHT_SUBMISSIONS are in flight); one not read back by then
+    // is given up.
+    if (gpu_timer.pending.size() >= GpuTimerSlots - 1) {
+        gpu_timer.pending.pop_front();
+    }
+    const u32 slot = gpu_timer.next;
+    gpu_timer.next = (slot + 1) % GpuTimerSlots;
+    current_cmdbuf.resetQueryPool(gpu_timer.pool, slot * 2, 2);
+    current_cmdbuf.writeTimestamp(vk::PipelineStageFlagBits::eTopOfPipe, gpu_timer.pool,
+                                  slot * 2);
+    gpu_timer.open = static_cast<s32>(slot);
+}
+
+void Scheduler::StopGpuTimer(u64 tick) {
+    if (!gpu_timer.pool || gpu_timer.open < 0) {
+        return;
+    }
+    const u32 slot = static_cast<u32>(gpu_timer.open);
+    current_cmdbuf.writeTimestamp(vk::PipelineStageFlagBits::eBottomOfPipe, gpu_timer.pool,
+                                  slot * 2 + 1);
+    gpu_timer.pending.push_back({slot, tick});
+    gpu_timer.open = -1;
+}
+
+void Scheduler::CollectGpuTimes() {
+    if (!gpu_timer.pool) {
+        return;
+    }
+    const auto column = perf_role == PerfRole::Title ? Common::PerfTrace::Time::GpuTitle
+                                                     : Common::PerfTrace::Time::GpuPresent;
+    // Only what the GPU is already known to have finished: asking it costs nothing then.
+    while (!gpu_timer.pending.empty() &&
+           master_semaphore.IsFree(gpu_timer.pending.front().tick)) {
+        const auto pending = gpu_timer.pending.front();
+        std::array<u64, 2> stamps{};
+        const vk::Result result = instance.GetDevice().getQueryPoolResults(
+            gpu_timer.pool, pending.slot * 2, 2, sizeof(stamps), stamps.data(), sizeof(u64),
+            vk::QueryResultFlagBits::e64);
+        if (result == vk::Result::eNotReady) {
+            break;
+        }
+        gpu_timer.pending.pop_front();
+        if (result != vk::Result::eSuccess) {
+            continue;
+        }
+        const u64 ticks = (stamps[1] - stamps[0]) & gpu_timer.valid_mask;
+        Common::PerfTrace::Add(column, std::chrono::nanoseconds{static_cast<s64>(
+                                           static_cast<double>(ticks) * gpu_timer.ns_per_tick)});
+        Common::PerfTrace::Add(Common::PerfTrace::Count::GpuTimed);
+    }
 }
 
 bool IsSyncTraceEnabled() {
@@ -685,11 +790,11 @@ void Scheduler::SubmitExecution(SubmitInfo& info) {
                                       : std::chrono::steady_clock::time_point{};
         master_semaphore.Wait(signal_value - MAX_IN_FLIGHT_SUBMISSIONS);
         if (timed) {
-            g_wait_times.throttle_ns += static_cast<u64>(
-                std::chrono::duration_cast<std::chrono::nanoseconds>(
-                    std::chrono::steady_clock::now() - wait_start)
-                    .count());
+            const auto waited = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                std::chrono::steady_clock::now() - wait_start);
+            g_wait_times.throttle_ns += static_cast<u64>(waited.count());
             ++g_wait_times.throttle_count;
+            Common::PerfTrace::Add(Common::PerfTrace::Time::WaitThrottle, waited);
         }
     }
 
@@ -704,6 +809,7 @@ void Scheduler::SubmitExecution(SubmitInfo& info) {
     EndRendering();
     draws_since_flush = 0;
     flush_due = false;
+    StopGpuTimer(signal_value);
     Check(current_cmdbuf.end());
 
     const vk::Semaphore timeline = master_semaphore.Handle();
@@ -765,6 +871,7 @@ void Scheduler::SubmitExecution(SubmitInfo& info) {
                      vk::to_string(submit_result));
     }
 
+    CollectGpuTimes();
     AllocateWorkerCommandBuffers();
 
     // Apply pending operations

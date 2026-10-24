@@ -360,6 +360,11 @@ public:
         return properties.limits.maxSamplerAnisotropy;
     }
 
+    /// Nanoseconds one tick of a GPU timestamp lasts.
+    float TimestampPeriod() const {
+        return properties.limits.timestampPeriod;
+    }
+
     /// Returns the maximum number of push descriptors.
     u32 MaxPushDescriptors() const {
         return push_descriptor_props.maxPushDescriptors;

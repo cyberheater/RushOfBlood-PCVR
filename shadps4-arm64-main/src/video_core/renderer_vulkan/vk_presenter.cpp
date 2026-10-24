@@ -509,6 +509,9 @@ Presenter::Presenter(Frontend::WindowSDL& window_, AmdGpu::Liverpool* liverpool_
       texture_cache{rasterizer->GetTextureCache()} {
     const u32 num_images = swapchain.GetImageCount();
     const vk::Device device = instance.GetDevice();
+    // (For the performance trace: the window's work is counted apart from the title's.)
+    present_scheduler.SetPerfRole(Scheduler::PerfRole::Present);
+    flip_scheduler.SetPerfRole(Scheduler::PerfRole::Present);
 
     // Create presentation frames.
     present_frames.resize(num_images);

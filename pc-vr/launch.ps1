@@ -2285,6 +2285,10 @@ if ($pace -eq "1") { $env:SHADPS4_VR_FASTEST_PACE = "1"; $env:SHADPS4_VR_FPS_CAP
 if ((Setting "headset" "1") -eq "0") { $env:SHADPS4_OPENXR = "0" }
 if ((Setting "pause" "1") -eq "0") { $env:SHADPS4_XR_PAUSE = "0" }
 $env:SHADPS4_XR_WAIT = Setting "wait" "60"
+# perf_trace=1: the emulator writes a per-frame performance trace (perf_frames.csv and
+# perf_headset.csv in user\log); tools\perf-report.py sums it up.
+$perfTrace = (Setting "perf_trace" "0") -eq "1"
+if ($perfTrace) { $env:SHADPS4_PERF_TRACE = "1" }
 foreach ($pair in $extraEnv) {
     $at = $pair.IndexOf("=")
     if ($at -ge 1) { Set-Item -Path ("Env:" + $pair.Substring(0, $at)) -Value $pair.Substring($at + 1) }
@@ -2470,6 +2474,9 @@ while (-not $process.HasExited) {
 }
 Show-Log
 Say ""
+if ($perfTrace -and (Test-Path (Join-Path $logDir "perf_frames.csv"))) {
+    Say ("Performance trace: " + (Join-Path $logDir "perf_frames.csv") + " and perf_headset.csv")
+}
 if ($null -ne $process.ExitCode -and $process.ExitCode -ne 0) {
     Say ("The emulator ended with code " + $process.ExitCode + ". Its log is $log") "Yellow"
     if ($memoryShort -and ((Get-Date) - $startedAt).TotalSeconds -lt 30) {

@@ -873,6 +873,8 @@ set(COMMON src/common/logging/classes.h
            src/common/native_clock.h
            src/common/path_util.cpp
            src/common/path_util.h
+           src/common/perf_trace.cpp
+           src/common/perf_trace.h
            src/common/object_pool.h
            src/common/polyfill_thread.h
            src/common/range_lock.h

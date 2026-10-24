@@ -5,6 +5,7 @@
 
 #include <chrono>
 #include <condition_variable>
+#include <deque>
 #include <mutex>
 #include <thread>
 #include <queue>
@@ -515,8 +516,24 @@ public:
 
     static std::mutex submit_mutex;
 
+    /// Which column of the performance trace (SHADPS4_PERF_TRACE) the GPU time of this
+    /// scheduler's submissions goes to.
+    enum class PerfRole : u8 {
+        Title,   ///< What the title draws, and what is done to it on the way to the headset.
+        Present, ///< Putting frames on the window.
+    };
+    void SetPerfRole(PerfRole role) {
+        perf_role = role;
+    }
+
 private:
     void AllocateWorkerCommandBuffers();
+
+    /// GPU timestamps around every command buffer, for the performance trace only.
+    void CreateGpuTimer();
+    void StartGpuTimer();
+    void StopGpuTimer(u64 tick);
+    void CollectGpuTimes();
 
     void SubmitExecution(SubmitInfo& info);
 
@@ -546,6 +563,23 @@ private:
     /// pipelines of its own, always in a pass of its own: nothing is assumed across passes.
     vk::Pipeline bound_pipeline{};
     tracy::VkCtxScope* profiler_scope{};
+
+    /// Pairs of timestamps, one pair a command buffer, used round as a ring (guarded by
+    /// submit_mutex, like everything SubmitExecution touches).
+    static constexpr u32 GpuTimerSlots = 256;
+    struct GpuTimer {
+        vk::QueryPool pool{};
+        double ns_per_tick{};
+        u64 valid_mask{};
+        u32 next{};
+        s32 open{-1}; ///< The slot of the command buffer being recorded, if it is timed.
+        struct Pending {
+            u32 slot;
+            u64 tick;
+        };
+        std::deque<Pending> pending;
+    } gpu_timer;
+    PerfRole perf_role{PerfRole::Title};
 };
 
 } // namespace Vulkan

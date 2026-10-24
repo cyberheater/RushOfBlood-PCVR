@@ -24,6 +24,7 @@
 #include <SDL3/SDL_events.h>
 
 #include "common/logging/log.h"
+#include "common/perf_trace.h"
 #include "common/polyfill_thread.h"
 #include "common/singleton.h"
 #include "common/thread.h"
@@ -1210,6 +1211,7 @@ struct OpenXrHost::Impl {
             }
 
             XrFrameState frame_state{XR_TYPE_FRAME_STATE};
+            const auto wait_started = Clock::now();
             if (const XrResult waited = xrWaitFrame(session, nullptr, &frame_state);
                 XR_FAILED(waited)) {
                 NoteFrameFailure("xrWaitFrame", waited);
@@ -1269,11 +1271,17 @@ struct OpenXrHost::Impl {
                 UpdatePad(pose_time);
             }
 
+            bool perf_new_frame = false;
+            double perf_copy_ms = 0.0;
             if (const s32 index = TakeFrame(); index >= 0) {
                 const auto started = Clock::now();
                 bool blank = false;
                 const bool copied = CopyFrame(static_cast<u32>(index), blank);
-                copy_time += std::chrono::duration<double>(Clock::now() - started).count();
+                const double copy_took =
+                    std::chrono::duration<double>(Clock::now() - started).count();
+                copy_time += copy_took;
+                perf_new_frame = copied;
+                perf_copy_ms = copy_took * 1e3;
                 std::scoped_lock lock{slot_mutex};
                 Slot& slot = slots[index];
                 if (copied) {
@@ -1320,6 +1328,26 @@ struct OpenXrHost::Impl {
             const double took = std::chrono::duration<double>(Clock::now() - ending).count();
             end_frame_time += took;
             end_frame_worst = std::max(end_frame_worst, took);
+            if (Common::PerfTrace::Enabled()) {
+                // One row a refresh: whether it brought a new frame of the title's, which is
+                // what shows judder (an uneven run of new and repeated frames).
+                static Clock::time_point perf_last_woke{};
+                const double interval_ms =
+                    perf_last_woke == Clock::time_point{}
+                        ? 0.0
+                        : std::chrono::duration<double, std::milli>(woke - perf_last_woke).count();
+                perf_last_woke = woke;
+                Common::PerfTrace::Headset({
+                    .interval_ms = interval_ms,
+                    .wait_ms = std::chrono::duration<double, std::milli>(woke - wait_started)
+                                   .count(),
+                    .copy_ms = perf_copy_ms,
+                    .end_ms = took * 1e3,
+                    .display_hz = rate > 30.0f ? rate : refresh_rate,
+                    .new_frame = perf_new_frame,
+                    .shown = layer_count != 0,
+                });
+            }
             if (layer_count != 0) {
                 // How far the head has turned from where the picture being shown was drawn
                 // for: what the compositor makes up for. Next to nothing while the head rests.

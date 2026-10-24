@@ -1,12 +1,14 @@
 // SPDX-FileCopyrightText: Copyright 2024-2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <chrono>
 #include <exception>
 #include <ranges>
 
 #include "common/hash.h"
 #include "common/io_file.h"
 #include "common/path_util.h"
+#include "common/perf_trace.h"
 #include "core/debug_state.h"
 #include "core/emulator_settings.h"
 #include "shader_recompiler/backend/spirv/emit_spirv.h"
@@ -28,6 +30,34 @@ namespace Vulkan {
 using Shader::LogicalStage;
 using Shader::Output;
 using Shader::Stage;
+
+namespace {
+/// Adds the time from its making to its end to a column of the performance trace
+/// (SHADPS4_PERF_TRACE), and one to a count. Does nothing while the trace is off.
+class CompileTimer {
+public:
+    CompileTimer(Common::PerfTrace::Time column_, Common::PerfTrace::Count count_)
+        : column{column_}, count{count_}, on{Common::PerfTrace::Enabled()} {
+        if (on) {
+            start = std::chrono::steady_clock::now();
+        }
+    }
+    ~CompileTimer() {
+        if (on) {
+            Common::PerfTrace::Add(column, std::chrono::steady_clock::now() - start);
+            Common::PerfTrace::Add(count);
+        }
+    }
+    CompileTimer(const CompileTimer&) = delete;
+    CompileTimer& operator=(const CompileTimer&) = delete;
+
+private:
+    Common::PerfTrace::Time column;
+    Common::PerfTrace::Count count;
+    bool on;
+    std::chrono::steady_clock::time_point start{};
+};
+} // namespace
 
 constexpr static auto SpirvVersion1_6 = 0x00010600U;
 
@@ -337,6 +367,8 @@ const GraphicsPipeline* PipelineCache::GetGraphicsPipeline() {
     }
     const auto [it, is_new] = graphics_pipelines.try_emplace(graphics_key);
     if (is_new) {
+        const CompileTimer timer{Common::PerfTrace::Time::PipelineCompile,
+                                 Common::PerfTrace::Count::Pipelines};
         const auto pipeline_hash = std::hash<GraphicsPipelineKey>{}(graphics_key);
         LOG_INFO(Render_Vulkan, "Compiling graphics pipeline {:#x}", pipeline_hash);
 
@@ -386,6 +418,8 @@ const ComputePipeline* PipelineCache::GetComputePipeline() {
     }
     const auto [it, is_new] = compute_pipelines.try_emplace(compute_key);
     if (is_new) {
+        const CompileTimer timer{Common::PerfTrace::Time::PipelineCompile,
+                                 Common::PerfTrace::Count::Pipelines};
         const auto pipeline_hash = std::hash<ComputePipelineKey>{}(compute_key);
         LOG_INFO(Render_Vulkan, "Compiling compute pipeline {:#x}", pipeline_hash);
 
@@ -637,6 +671,8 @@ bool PipelineCache::RefreshComputeKey() {
 vk::ShaderModule PipelineCache::CompileModule(Shader::Info& info, Shader::RuntimeInfo& runtime_info,
                                               const std::span<const u32>& code, size_t perm_idx,
                                               Shader::Backend::Bindings& binding) {
+    const CompileTimer timer{Common::PerfTrace::Time::ShaderCompile,
+                             Common::PerfTrace::Count::Shaders};
     LOG_INFO(Render_Vulkan, "Compiling {} shader {:#x} {}", info.stage, info.pgm_hash,
              perm_idx != 0 ? "(permutation)" : "");
     DumpShader(code, info.pgm_hash, info.stage, perm_idx, "bin");
