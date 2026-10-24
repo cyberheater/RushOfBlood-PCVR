@@ -2214,6 +2214,15 @@ $fxaa = 0.65
 if (-not [double]::TryParse((Setting "fxaa" "0.65"), [System.Globalization.NumberStyles]::Float, [System.Globalization.CultureInfo]::InvariantCulture, [ref]$fxaa)) { $fxaa = 0.65 }
 $fxaa = [math]::Max(0.0, [math]::Min(1.0, $fxaa))
 if ($fxaa -gt 0) { $env:SHADPS4_VR_FXAA = $fxaa.ToString([System.Globalization.CultureInfo]::InvariantCulture) }
+# black: the picture's black point, 0 to 0.3 (blacks that look grey); gamma: its curve, 0.5 to 1.5.
+foreach ($pair in @(@("black", "SHADPS4_VR_BLACK", 0.0, 0.3), @("gamma", "SHADPS4_VR_GAMMA", 0.5, 1.5))) {
+    $number = 0.0
+    $raw = Setting $pair[0] ""
+    if ($raw -ne "" -and [double]::TryParse($raw, [System.Globalization.NumberStyles]::Float, [System.Globalization.CultureInfo]::InvariantCulture, [ref]$number)) {
+        $number = [math]::Max($pair[2], [math]::Min($pair[3], $number))
+        Set-Item -Path ("Env:" + $pair[1]) -Value $number.ToString([System.Globalization.CultureInfo]::InvariantCulture)
+    }
+}
 # pc_view: what the window on the PC shows (the headset is not affected): left or right, one eye
 # cropped to fill the window; merged, both eyes joined into one picture; both, the picture with both
 # lens circles. pc_zoom, in percent: 100 fits the window with no black corners, less is closer in.

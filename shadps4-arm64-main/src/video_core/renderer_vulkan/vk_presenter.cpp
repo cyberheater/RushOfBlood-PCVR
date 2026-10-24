@@ -1168,6 +1168,24 @@ HmdFrames Presenter::PrepareHmdFrame(std::span<const AmdGpu::Image, 2> eye_textu
                                 : 0.0f;
     }();
     hmd_settings.fxaa = fxaa;
+    // SHADPS4_VR_BLACK=<0..0.3>: the black point of the picture on its way to the headset (and
+    // the window's look at it), for blacks that look grey: what is this dark or darker becomes
+    // black, the rest is spread back over the range. SHADPS4_VR_GAMMA=<0.5..1.5>: the curve the
+    // picture is encoded with (1: sRGB as it is; below 1 brighter mid-tones, above 1 darker).
+    static const float black = [] {
+        const char* value = std::getenv("SHADPS4_VR_BLACK");
+        return value != nullptr ? std::clamp(static_cast<float>(std::atof(value)), 0.0f, 0.3f)
+                                : 0.0f;
+    }();
+    static const float vr_gamma = [] {
+        const char* value = std::getenv("SHADPS4_VR_GAMMA");
+        return value != nullptr ? std::clamp(static_cast<float>(std::atof(value)), 0.5f, 1.5f)
+                                : 0.0f;
+    }();
+    hmd_settings.black = black;
+    if (vr_gamma > 0.0f) {
+        hmd_settings.gamma = vr_gamma;
+    }
     if (frame != nullptr) {
         // The marker is for hosts that only see the picture; a VR host is told the frame's id.
         const std::optional<u32> marker =

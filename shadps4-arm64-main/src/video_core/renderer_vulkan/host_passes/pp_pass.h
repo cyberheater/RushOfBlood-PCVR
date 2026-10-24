@@ -41,6 +41,9 @@ public:
         /// right (the right eye's) across the middle, and this is half the width of the fade.
         float stitch = 0.0f;
         float stitch_shift = 0.0f;
+        /// 0: off. Above (up to 0.3): the black point of the picture as it goes to the display:
+        /// what is this dark or darker becomes black, the rest is spread back over the range.
+        float black = 0.0f;
     };
 
     void Create(const Instance& instance, MasterSemaphore* master_semaphore,

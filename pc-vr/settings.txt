@@ -62,6 +62,14 @@
 # what smooths its edges; a bigger eye_width (supersampling) does it best. (The window sets it.)
 #fxaa=0.65
 
+# The black point of the picture on its way to the headset, 0 (off) to 0.3, for blacks that look
+# grey: what is this dark or darker shows as black, and the rest is spread back over the range so
+# the whites stay as they were. 0.03 to 0.08 is a good range to try; too much and the darkest
+# parts of the scenes lose their detail. gamma, 0.5 to 1.5, is the curve the picture is shown
+# with: 1 as the game draws it, above 1 darker mid-tones, below 1 brighter. (Not in the window.)
+#black=0
+#gamma=1
+
 # What the window of the game on the PC shows, which is also what a screen recording of it sees
 # (the headset is not affected): left or right, that eye's picture cropped to fill the window like
 # a normal game (left is the default); merged, both eyes joined into one flat picture; both, the

@@ -35,6 +35,10 @@ layout (push_constant) uniform settings {
     // that fade, in output units (0.5: the whole width is a fade).
     float stitch;
     float stitch_shift;
+    // Above 0, the black point of the picture as it goes to the display (0 to 0.3): what is this
+    // dark or darker becomes black, and the rest is spread back over the whole range, so that
+    // the whites stay where they were. For blacks that look grey.
+    float black;
 } pp;
 
 const float cutoff = 0.0031308, a = 1.055, b = 0.055, d = 12.92;
@@ -107,6 +111,10 @@ vec4 processed(vec2 uv) {
         vec3 weight = room * (-1.0 / mix(8.0, 5.0, clamp(pp.sharpen, 0.0, 1.0)));
         here = clamp(((above + below + left + right) * weight + here) / (1.0 + 4.0 * weight),
                      0.0, 1.0);
+    }
+    if (pp.black > 0.0) {
+        // In display terms (after the encoding above), as a black level on a screen is set.
+        here = clamp((here - pp.black) / (1.0 - pp.black), 0.0, 1.0);
     }
     if (pp.mask > 0.0) {
         // Circles as measured on the title's picture: centres and radii in picture units.
