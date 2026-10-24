@@ -13,6 +13,8 @@
 !/THIRD-PARTY-NOTICES.md
 !/Play Rush of Blood.bat
 !/shadps4-arm64-main/
+# The scripts and patches the play folder was first built with (see install/README.md).
+!/install/
 
 # The PC play folder: only the launcher, its settings and the clean starting files of a release
 # (pc-vr/template), not the emulator built into it, nor its user folder (saves, logs, shader
@@ -22,6 +24,8 @@
 !/pc-vr/launch.ps1
 !/pc-vr/settings.txt
 !/pc-vr/template/
+# The emulator as built from this source, so the play folder works without building it.
+!/pc-vr/shadps4.exe
 
 # Scripts yes, toolchains and downloads no (clang, CMake, Ninja, Windows SDK, sysroot, jadx,
 # PkgTool: see tools/make-release.ps1).

@@ -1,0 +1,1309 @@
+From 85432569305b0c4df6e0973468314a2342bced9b Mon Sep 17 00:00:00 2001
+From: RushVR Move fork <noreply@anthropic.com>
+Date: Sat, 24 Oct 2026 12:42:13 +0100
+Subject: [PATCH] Add Quest controllers as PlayStation Move wands
+
+Implements libSceMove on top of the headset's own controllers (right =
+first wand, left = second), tracks both wands in libSceVrTracker, reads
+the Touch controllers' buttons, trigger, stick and haptics through
+OpenXR, and turns the launcher's Controllers card on. Enabled with
+SHADPS4_QUEST_MOVE=1 (controllers=quest); the DualSense path is
+unchanged otherwise.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_011WML1cF3Vk7U9nsxKAqLov
+---
+ CHANGELOG.md                                  |  18 ++
+ README.md                                     |  35 +++
+ pc-vr/launch.ps1                              |  47 +--
+ pc-vr/settings.txt                            |  12 +-
+ .../src/core/libraries/move/move.cpp          | 174 ++++++++++-
+ .../src/core/libraries/move/move.h            |   3 +
+ .../core/libraries/vr_tracker/vr_tracker.cpp  |  66 +++-
+ .../src/core/vr/openxr_host.cpp               | 283 +++++++++++++++++-
+ shadps4-arm64-main/src/core/vr/vr_runtime.cpp | 155 +++++++++-
+ shadps4-arm64-main/src/core/vr/vr_runtime.h   |  73 +++++
+ tools/make-release.ps1                        |   6 +-
+ 11 files changed, 790 insertions(+), 82 deletions(-)
+
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index 7c9a933..096028f 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -3,6 +3,24 @@
+ All notable changes to RushVR, newest first. RushVR is shadPS4 plus a VR layer and the fixes that
+ let Until Dawn: Rush of Blood run under emulation.
+ 
++## Move controllers fork (based on 0.4.1) - unreleased
++
++An open implementation of the Quest controllers as the game's two PlayStation Move wands, written
++from scratch on top of the free 0.4.1 source (not the paid Motion edition). Untested on hardware
++yet: please report what you find, with `pc-vr\user\log\shad_log.txt`.
++
++- **libSceMove implemented** (`src/core/libraries/move/move.cpp`): with `SHADPS4_QUEST_MOVE=1`
++  (`controllers=quest`) two wands open, report as connected, and give the title their buttons,
++  analog trigger and motion sensors; their rumble goes to the Quest controllers.
++- **Two Move wands tracked** (`libSceVrTracker`): both register, and each is placed by its
++  controller's grip pose, raised by `move_pitch`, its sphere put 6 cm ahead of the hand
++  (`SHADPS4_QUEST_MOVE_SPHERE` in metres), its reach scaled about the head (`move_reach`) and its
++  turning scaled about level-and-facing-ahead (`move_turn`).
++- **Quest controller input** (`src/core/vr/openxr_host.cpp`): right controller = first wand, left =
++  second. Trigger = T, grip = MOVE, A/X = cross, B/Y = circle, stick click = square, stick up =
++  triangle, stick down = select, left menu = START when tapped (held a second it resets the view instead, with no START).
++- **Launcher**: the Controllers card is always on (the fork's emulator has the support built in).
++
+ ## 0.4.1 - 2026-10-22
+ 
+ The new start-up window and a fix for streaks of colour in level 2. (The paid Motion edition keeps
+diff --git a/README.md b/README.md
+index f29281b..9a8b92a 100644
+--- a/README.md
++++ b/README.md
+@@ -83,6 +83,41 @@ See [CHANGELOG.md](CHANGELOG.md) for what changed in each version.
+ Your saves, settings and the log are in `pc-vr\user` next to the launcher: the log is
+ `pc-vr\user\log\shad_log.txt`, the saves are in `pc-vr\user\home`.
+ 
++## Move controllers (this fork)
++
++This fork adds the Quest controllers as the game's two **PlayStation Move wands**, written from
++scratch on the free source (it is not the author's paid Motion edition, and contains none of it).
++It is **untested on real hardware so far**: expect to tune it.
++
++1. In the start-up window, turn on **Quest controllers as Move wands** (or set
++   `controllers=quest` in `pc-vr\settings.txt`).
++2. **Unplug the DualSense** (or switch it off): while one is connected the game uses it instead.
++3. In Virtual Desktop, make sure the **controllers** (not hand tracking) are what the PC sees.
++4. In the game's start-up question choose the **Move controllers**.
++
++| Quest controller | Move wand |
++| --- | --- |
++| Right controller / left controller | First wand / second wand |
++| Trigger | T (analog) |
++| Grip | MOVE button |
++| A or X | Cross |
++| B or Y | Circle |
++| Stick click | Square |
++| Stick up / down | Triangle / Select |
++| Left menu button | START when tapped; held one second it resets the view instead |
++
++The three sliders under the switch change how the guns follow your hands: **Aim angle**
++(`move_pitch`, degrees the gun is raised above the controller's handle), **Reach** (`move_reach`,
++how far the in-game hands move compared with yours, measured from your head) and **Turning**
++(`move_turn`, how far the guns turn compared with your wrists). If the guns point low, raise the
++aim angle; if they feel sluggish or too far from your hands, raise reach and turning towards 100.
++`env=SHADPS4_QUEST_MOVE_SPHERE=0.06` sets how far ahead of the hand the tracked sphere sits, in
++metres.
++
++What to send when reporting a problem: `pc-vr\user\log\shad_log.txt`. The lines that matter
++start with `Lib_Move`, `Lib_VrTracker` and `Core_Vr` ("Move wand 1 is the right controller", "Move
++wand registered", any "NOT TRACKING" line about a Move).
++
+ ## Settings
+ 
+ Settings are in `pc-vr\settings.txt`, one `key=value` a line (the small window at start-up changes
+diff --git a/pc-vr/launch.ps1 b/pc-vr/launch.ps1
+index 1f10b68..10fd0a5 100644
+--- a/pc-vr/launch.ps1
++++ b/pc-vr/launch.ps1
+@@ -48,37 +48,10 @@ function Save-Setting([string]$key, [string]$value) {
+ }
+ Read-Settings
+ 
+-# The Motion edition (the one with the Quest controllers playing as PlayStation Move wands) has a
+-# file "license.dat" next to this launcher, signed by the maker (ECDSA P-256; this launcher holds
+-# only the public key). Without a valid one the choice of controllers below stays switched off: the
+-# emulator of the free edition has no Move support in it, and the Motion emulator checks the same
+-# file itself. Changing the text of the file breaks the signature.
+-$licensePublicKey = "ce24b402a7cf69a13d6db787f873722ccb6302432069fc63ad7e0470cf3dfc41e3d2d62d23684aa3df447db9c9fc53364e7fb428d65d830a8d9cbad7d0b27592"
+-function Test-MotionEdition {
+-    try {
+-        if ($licensePublicKey -notmatch '^[0-9a-fA-F]{128}$') { return $false }
+-        $path = Join-Path $here "license.dat"
+-        if (-not (Test-Path -LiteralPath $path)) { return $false }
+-        $lines = @([IO.File]::ReadAllLines($path) | ForEach-Object { $_.Trim() } | Where-Object { $_ -ne "" })
+-        if ($lines.Count -lt 3) { return $false }
+-        $last = $lines[$lines.Count - 1]
+-        if (-not $last.StartsWith("signature=")) { return $false }
+-        $body = @($lines[0..($lines.Count - 2)])
+-        if ($body[0] -ne "RushVR-Motion-License-1" -or ($body -notcontains "edition=motion")) { return $false }
+-        $payload = [Text.Encoding]::UTF8.GetBytes(($body -join "`n"))
+-        $signature = [Convert]::FromBase64String($last.Substring(10))
+-        # A BCRYPT_ECCKEY_BLOB: the magic "ECS1" (ECDSA public P-256), the key size 32, X and Y.
+-        $blob = New-Object byte[] 72
+-        [BitConverter]::GetBytes([uint32]0x31534345).CopyTo($blob, 0)
+-        [BitConverter]::GetBytes([uint32]32).CopyTo($blob, 4)
+-        for ($i = 0; $i -lt 64; $i++) { $blob[8 + $i] = [Convert]::ToByte($licensePublicKey.Substring($i * 2, 2), 16) }
+-        $cng = [Security.Cryptography.CngKey]::Import($blob, [Security.Cryptography.CngKeyBlobFormat]::EccPublicBlob)
+-        $ecdsa = New-Object Security.Cryptography.ECDsaCng($cng)
+-        return [bool]$ecdsa.VerifyData($payload, $signature, [Security.Cryptography.HashAlgorithmName]::SHA256)
+-    } catch {}
+-    return $false
+-}
+-$motionEdition = Test-MotionEdition
++# This fork's emulator plays the Quest controllers as the game's two PlayStation Move wands
++# itself (src/core/libraries/move, src/core/vr), so the choice of controllers below is always
++# offered. ($motionEdition keeps its old name so the rest of the launcher reads as upstream.)
++$motionEdition = $true
+ # The version shown in the window's banner (the release scripts check that it is the release's).
+ $launcherVersion = "0.4.1"
+ 
+@@ -1780,8 +1753,8 @@ function Show-MenuModern {
+         # The banner: name, edition, version, and the minimize and close buttons.
+         $header = New-Object RushUi.Header
+         $header.SetBounds(1, 1, 734, 84)
+-        $header.Badge = $(if ($motionEdition) { "MOTION" } else { "FREE" })
+-        $header.BadgeSolid = $motionEdition
++        $header.Badge = "MOVE"
++        $header.BadgeSolid = $false
+         $header.Version = $launcherVersion
+         $form.Controls.Add($header)
+         $minimizeButton = New-Object RushUi.CaptionButton
+@@ -1994,7 +1967,7 @@ function Show-MenuModern {
+         foreach ($c in $windowCard.Controls) { $c.Visible = $false }
+         $tips.SetToolTip($windowCard, "Click to show or hide what the window on the PC shows.")
+ 
+-        # Row 5: controllers, the DualSense or the Quest controllers playing as Move wands (Motion edition).
++        # Row 5: controllers, the DualSense or the Quest controllers playing as Move wands.
+         $moveHeight = $(if ($motionEdition) { 108 } else { 46 })
+         $moveCard = New-Card "Controllers" 24 480 688 $moveHeight
+         $form.Controls.Add($moveCard)
+@@ -2004,7 +1977,7 @@ function Show-MenuModern {
+         $moveOn.Checked = ($motionEdition -and ((Setting "controllers" "dualsense") -eq "quest"))
+         $moveOn.Enabled = $motionEdition
+         $moveCard.Controls.Add($moveOn)
+-        $tips.SetToolTip($moveOn, "Plays with the Quest controllers, as the game's two PlayStation Move wands, instead of the DualSense. In the game's start-up question choose the Move controllers. Unplug the DualSense first: the game uses it instead when it is connected. Motion edition only.")
++        $tips.SetToolTip($moveOn, "Plays with the Quest controllers, as the game's two PlayStation Move wands, instead of the DualSense. In the game's start-up question choose the Move controllers. Unplug the DualSense first: the game uses it instead when it is connected.")
+         $moveDefaults = @(35, 55, 65)
+         $moveKeys = @("move_pitch", "move_reach", "move_turn")
+         $moveTitles = @("Aim angle", "Reach", "Turning")
+@@ -2259,7 +2232,7 @@ $pcZoom = 100.0
+ if ([double]::TryParse((Setting "pc_zoom" "100"), [System.Globalization.NumberStyles]::Float, [System.Globalization.CultureInfo]::InvariantCulture, [ref]$pcZoom) -and $pcZoom -ne 100.0) {
+     $env:SHADPS4_PC_WINDOW_ZOOM = ([math]::Max(30.0, [math]::Min(200.0, $pcZoom)) / 100.0).ToString([System.Globalization.CultureInfo]::InvariantCulture)
+ }
+-# Motion edition: the Quest controllers play as Move wands when "controllers=quest" (the window sets
++# The Quest controllers play as Move wands when "controllers=quest" (the window sets
+ # it); move_pitch is in degrees, move_reach and move_turn in percent. What is not set is left to the
+ # emulator's own recommended values.
+ Remove-Item -Path Env:SHADPS4_QUEST_MOVE -ErrorAction SilentlyContinue
+@@ -2417,7 +2390,7 @@ if ($env:SHADPS4_QUEST_MOVE -eq "1") {
+     Say "In the game's start-up question choose the Move controllers, then press the grip button"
+     Say "(the MOVE button) on the controller you hold. Right hand = the first wand."
+     Say "Trigger = T, grip = MOVE, A/X = cross, B/Y = circle, stick click = square,"
+-    Say "stick up = triangle, stick down = select, left menu = start (hold it for a second to reset the view)."
++    Say "stick up = triangle, stick down = select, left menu = start (hold it for a second to reset the view instead)."
+ } else {
+     Say "The DualSense: connect it to THIS PC (USB cable, or Bluetooth paired with the PC). Paired with"
+     Say "the headset, it reaches the PC through Virtual Desktop without motion sensors or touchpad."
+diff --git a/pc-vr/settings.txt b/pc-vr/settings.txt
+index 9064962..dca9ec1 100644
+--- a/pc-vr/settings.txt
++++ b/pc-vr/settings.txt
+@@ -133,18 +133,18 @@
+ #game=C:\path\to\CUSA03683\eboot.bin
+ 
+ # Which controllers play the game: dualsense (the default), or quest (the Quest controllers play
+-# as the game's two PlayStation Move wands). Quest is for the Motion edition only: it needs that
+-# edition's emulator, and the window greys the choice out without it. (The window sets it.)
++# as the game's two PlayStation Move wands: right = the first, left = the second; in the game's
++# start-up question choose the Move controllers). (The window sets it.)
+ #controllers=dualsense
+ 
+-# The Motion edition's Quest controllers, set by three sliders in the window: move_pitch, how
++# The Quest controllers as Move wands, set by three sliders in the window: move_pitch, how
+ # far the in-game guns are raised above the way the controller points, in degrees (0 to 90);
+ # move_reach, how far the in-game hands move when yours do, in percent of your own movement (5 to
+ # 130); and move_turn, how far the guns turn when you turn your wrist, in percent (5 to 130).
+-# Ignored without the Motion edition.
++# Used only with controllers=quest. The window's recommended values:
+ #move_pitch=35
+-#move_reach=35
+-#move_turn=42
++#move_reach=55
++#move_turn=65
+ 
+ # Extra environment variables for the emulator, as many lines as needed.
+ #env=NAME=value
+diff --git a/shadps4-arm64-main/src/core/libraries/move/move.cpp b/shadps4-arm64-main/src/core/libraries/move/move.cpp
+index b7e86a2..1c7071c 100644
+--- a/shadps4-arm64-main/src/core/libraries/move/move.cpp
++++ b/shadps4-arm64-main/src/core/libraries/move/move.cpp
+@@ -1,36 +1,133 @@
+ // SPDX-FileCopyrightText: Copyright 2024 shadPS4 Emulator Project
+ // SPDX-License-Identifier: GPL-2.0-or-later
+ 
++#include <array>
++#include <atomic>
++#include <mutex>
++
+ #include "common/logging/log.h"
+ #include "core/libraries/error_codes.h"
++#include "core/libraries/kernel/time.h"
+ #include "core/libraries/libs.h"
+ #include "core/libraries/move/move.h"
+ #include "core/libraries/move/move_error.h"
+-#include "move.h"
++#include "core/vr/vr_runtime.h"
++
++// With SHADPS4_QUEST_MOVE=1 the headset's own controllers play as two PlayStation Move wands
++// (see Core::Vr::OpenXrHost::UpdateMoves): the title opens them here, reads their buttons and
++// motion sensors here, and asks libSceVrTracker where they are. Without it no wand is ever
++// connected, as before.
+ 
+ namespace Libraries::Move {
+ 
+-static bool g_library_initialized = false;
++namespace {
++
++constexpr s32 FirstHandle = 0x30b0000;
++
++struct Wand {
++    s32 handle{-1};
++    std::atomic<u32> count{};
++};
++
++bool g_library_initialized = false;
++std::mutex g_mutex;
++// Even when no controllers are connected, a proper handle is returned: libSceVrTracker
++// requires it to be different from those of other devices.
++s32 g_next_handle = FirstHandle;
++std::array<Wand, Core::Vr::NumMoveWands> g_wands;
++
++bool WandsEnabled() {
++    return Core::Vr::Runtime::Instance().MoveWandsEnabled();
++}
++
++/// The wand a handle stands for, or -1 for one that is open but has no wand behind it.
++int FindWand(s32 handle) {
++    std::scoped_lock lock{g_mutex};
++    for (int i = 0; i < static_cast<int>(g_wands.size()); ++i) {
++        if (g_wands[i].handle == handle) {
++            return i;
++        }
++    }
++    return -1;
++}
++
++/// What the wand's motion sensors would read, from how the host says it is turned and moves:
++/// gravity (in g, as the console reports it) and the turning rate (rad/s), in the wand's own
++/// frame (+X right, +Y up, -Z towards the sphere when it points ahead).
++void FillSensors(const Core::Vr::DeviceState& state, OrbisMoveData& data) {
++    using namespace Core::Vr;
++    const Quat to_wand = Conjugate(state.pose.orientation);
++    const Vec3 up = Rotate(to_wand, {0.0f, 1.0f, 0.0f});
++    data.accelerometer[0] = up.x;
++    data.accelerometer[1] = up.y;
++    data.accelerometer[2] = up.z;
++    const Vec3 spin = Rotate(to_wand, state.angular_velocity);
++    data.gyro[0] = spin.x;
++    data.gyro[1] = spin.y;
++    data.gyro[2] = spin.z;
++}
++
++void FillState(int wand, OrbisMoveData& data) {
++    auto& runtime = Core::Vr::Runtime::Instance();
++    data = {};
++    const Core::Vr::DeviceState state = runtime.GetMove(wand);
++    if (state.tracked) {
++        FillSensors(state, data);
++    } else {
++        // Lying still, pointing ahead.
++        data.accelerometer[1] = 1.0f;
++    }
++    const Core::Vr::MoveInput input = runtime.GetMoveInput(wand);
++    data.button_data.button_data = input.buttons;
++    data.button_data.trigger_data = input.trigger;
++    data.timestamp = static_cast<s64>(Libraries::Kernel::sceKernelGetProcessTime());
++    data.count = static_cast<s32>(g_wands[wand].count.fetch_add(1) + 1);
++    data.temperature = 30.0f;
++}
++
++} // namespace
++
++int WandForHandle(s32 handle) {
++    if (!WandsEnabled()) {
++        return -1;
++    }
++    return FindWand(handle);
++}
+ 
+ s32 PS4_SYSV_ABI sceMoveInit() {
+     if (g_library_initialized) {
+         return ORBIS_MOVE_ERROR_ALREADY_INIT;
+     }
+-    LOG_WARNING(Lib_Move, "Move controllers are not supported yet");
++    if (WandsEnabled()) {
++        LOG_INFO(Lib_Move, "Move wands: the headset's controllers (right = first, left = second)");
++    } else {
++        LOG_WARNING(Lib_Move, "Move controllers are not supported yet (SHADPS4_QUEST_MOVE=1 "
++                              "plays them with the headset's controllers)");
++    }
+     g_library_initialized = true;
+     return ORBIS_OK;
+ }
+ 
+ s32 PS4_SYSV_ABI sceMoveOpen(Libraries::UserService::OrbisUserServiceUserId user_id, s32 type,
+                              s32 index) {
+-    LOG_DEBUG(Lib_Move, "called");
++    LOG_DEBUG(Lib_Move, "called, user_id = {}, type = {}, index = {}", user_id, type, index);
+     if (!g_library_initialized) {
+         return ORBIS_MOVE_ERROR_NOT_INIT;
+     }
+-    // Even when no controllers are connected, this returns a proper handle.
+-    // Internal libSceVrTracker logic requires this handle to be different from other devices.
+-    static s32 handle = 0x30b0000;
+-    return handle += 0x100;
++    if (index < 0 && WandsEnabled()) {
++        return ORBIS_MOVE_ERROR_INVALID_ARG;
++    }
++    std::scoped_lock lock{g_mutex};
++    g_next_handle += 0x100;
++    const s32 handle = g_next_handle;
++    if (WandsEnabled() && index < static_cast<s32>(g_wands.size())) {
++        if (g_wands[index].handle != -1) {
++            return ORBIS_MOVE_ERROR_ALREADY_OPENED;
++        }
++        g_wands[index].handle = handle;
++        LOG_INFO(Lib_Move, "Move wand {} opened as handle {:#x}", index + 1, handle);
++    }
++    return handle;
+ }
+ 
+ s32 PS4_SYSV_ABI sceMoveGetDeviceInfo(s32 handle, OrbisMoveDeviceInfo* info) {
+@@ -41,18 +138,31 @@ s32 PS4_SYSV_ABI sceMoveGetDeviceInfo(s32 handle, OrbisMoveDeviceInfo* info) {
+     if (info == nullptr) {
+         return ORBIS_MOVE_ERROR_INVALID_ARG;
+     }
+-    return ORBIS_MOVE_ERROR_NO_CONTROLLER_CONNECTED;
++    if (WandForHandle(handle) < 0) {
++        return ORBIS_MOVE_ERROR_NO_CONTROLLER_CONNECTED;
++    }
++    // The sphere of a Move is 45 mm across.
++    info->sphere_radius = 0.0225f;
++    info->accelerometer_offset[0] = 0.0f;
++    info->accelerometer_offset[1] = 0.0f;
++    info->accelerometer_offset[2] = 0.0f;
++    return ORBIS_OK;
+ }
+ 
+ s32 PS4_SYSV_ABI sceMoveReadStateLatest(s32 handle, OrbisMoveData* data) {
+-    LOG_TRACE(Lib_Move, "(called");
++    LOG_TRACE(Lib_Move, "called");
+     if (!g_library_initialized) {
+         return ORBIS_MOVE_ERROR_NOT_INIT;
+     }
+     if (data == nullptr) {
+         return ORBIS_MOVE_ERROR_INVALID_ARG;
+     }
+-    return ORBIS_MOVE_ERROR_NO_CONTROLLER_CONNECTED;
++    const int wand = WandForHandle(handle);
++    if (wand < 0) {
++        return ORBIS_MOVE_ERROR_NO_CONTROLLER_CONNECTED;
++    }
++    FillState(wand, *data);
++    return ORBIS_OK;
+ }
+ 
+ s32 PS4_SYSV_ABI sceMoveReadStateRecent(s32 handle, s64 timestamp, OrbisMoveData* data,
+@@ -64,7 +174,14 @@ s32 PS4_SYSV_ABI sceMoveReadStateRecent(s32 handle, s64 timestamp, OrbisMoveData
+     if (timestamp < 0 || data == nullptr || out_count == nullptr) {
+         return ORBIS_MOVE_ERROR_INVALID_ARG;
+     }
+-    return ORBIS_MOVE_ERROR_NO_CONTROLLER_CONNECTED;
++    const int wand = WandForHandle(handle);
++    if (wand < 0) {
++        return ORBIS_MOVE_ERROR_NO_CONTROLLER_CONNECTED;
++    }
++    // The host gives one state a frame: that is the only one there is since `timestamp`.
++    FillState(wand, data[0]);
++    *out_count = 1;
++    return ORBIS_OK;
+ }
+ 
+ s32 PS4_SYSV_ABI sceMoveGetExtensionPortInfo(s32 handle, void* data) {
+@@ -79,11 +196,16 @@ s32 PS4_SYSV_ABI sceMoveGetExtensionPortInfo(s32 handle, void* data) {
+ }
+ 
+ s32 PS4_SYSV_ABI sceMoveSetVibration(s32 handle, u8 intensity) {
+-    LOG_TRACE(Lib_Move, "called");
++    LOG_TRACE(Lib_Move, "called, intensity = {}", intensity);
+     if (!g_library_initialized) {
+         return ORBIS_MOVE_ERROR_NOT_INIT;
+     }
+-    return ORBIS_MOVE_ERROR_NO_CONTROLLER_CONNECTED;
++    const int wand = WandForHandle(handle);
++    if (wand < 0) {
++        return ORBIS_MOVE_ERROR_NO_CONTROLLER_CONNECTED;
++    }
++    Core::Vr::Runtime::Instance().SetMoveVibration(wand, intensity);
++    return ORBIS_OK;
+ }
+ 
+ s32 PS4_SYSV_ABI sceMoveSetLightSphere(s32 handle, u8 red, u8 green, u8 blue) {
+@@ -91,7 +213,12 @@ s32 PS4_SYSV_ABI sceMoveSetLightSphere(s32 handle, u8 red, u8 green, u8 blue) {
+     if (!g_library_initialized) {
+         return ORBIS_MOVE_ERROR_NOT_INIT;
+     }
+-    return ORBIS_MOVE_ERROR_NO_CONTROLLER_CONNECTED;
++    const int wand = WandForHandle(handle);
++    if (wand < 0) {
++        return ORBIS_MOVE_ERROR_NO_CONTROLLER_CONNECTED;
++    }
++    Core::Vr::Runtime::Instance().SetMoveLight(wand, red, green, blue);
++    return ORBIS_OK;
+ }
+ 
+ s32 PS4_SYSV_ABI sceMoveResetLightSphere(s32 handle) {
+@@ -108,6 +235,12 @@ s32 PS4_SYSV_ABI sceMoveClose(s32 handle) {
+     if (!g_library_initialized) {
+         return ORBIS_MOVE_ERROR_NOT_INIT;
+     }
++    const int wand = FindWand(handle);
++    if (wand >= 0) {
++        Core::Vr::Runtime::Instance().SetMoveVibration(wand, 0);
++        std::scoped_lock lock{g_mutex};
++        g_wands[wand].handle = -1;
++    }
+     return ORBIS_OK;
+ }
+ 
+@@ -116,6 +249,15 @@ s32 PS4_SYSV_ABI sceMoveTerm() {
+     if (!g_library_initialized) {
+         return ORBIS_MOVE_ERROR_NOT_INIT;
+     }
++    {
++        std::scoped_lock lock{g_mutex};
++        for (int i = 0; i < static_cast<int>(g_wands.size()); ++i) {
++            if (g_wands[i].handle != -1) {
++                Core::Vr::Runtime::Instance().SetMoveVibration(i, 0);
++            }
++            g_wands[i].handle = -1;
++        }
++    }
+     g_library_initialized = false;
+     return ORBIS_OK;
+ }
+@@ -134,4 +276,4 @@ void RegisterLib(Core::Loader::SymbolsResolver* sym) {
+     LIB_FUNCTION("tsZi60H4ypY", "libSceMove", 1, "libSceMove", sceMoveTerm);
+ };
+ 
+-} // namespace Libraries::Move
+\ No newline at end of file
++} // namespace Libraries::Move
+diff --git a/shadps4-arm64-main/src/core/libraries/move/move.h b/shadps4-arm64-main/src/core/libraries/move/move.h
+index 7300226..1feebae 100644
+--- a/shadps4-arm64-main/src/core/libraries/move/move.h
++++ b/shadps4-arm64-main/src/core/libraries/move/move.h
+@@ -43,5 +43,8 @@ struct OrbisMoveData {
+     float temperature;
+ };
+ 
++/// The Move wand (0 or 1) an open handle stands for, or -1 for none (for libSceVrTracker).
++int WandForHandle(s32 handle);
++
+ void RegisterLib(Core::Loader::SymbolsResolver* sym);
+ } // namespace Libraries::Move
+\ No newline at end of file
+diff --git a/shadps4-arm64-main/src/core/libraries/vr_tracker/vr_tracker.cpp b/shadps4-arm64-main/src/core/libraries/vr_tracker/vr_tracker.cpp
+index 3ca36fc..bc4c3cf 100644
+--- a/shadps4-arm64-main/src/core/libraries/vr_tracker/vr_tracker.cpp
++++ b/shadps4-arm64-main/src/core/libraries/vr_tracker/vr_tracker.cpp
+@@ -18,6 +18,7 @@
+ #include "common/logging/log.h"
+ #include "core/libraries/error_codes.h"
+ #include "core/libraries/kernel/time.h"
++#include "core/libraries/move/move.h"
+ #include "core/libraries/libs.h"
+ #include "core/libraries/vr_tracker/vr_tracker.h"
+ #include "core/known_title.h"
+@@ -48,7 +49,9 @@ struct PadRegistration {
+ };
+ static std::vector<PadRegistration> g_pads;
+ static std::mutex g_pads_mutex;
+-static s32 g_move_handle = -1;
++// The Move wands registered, in the order they were (guarded by g_pads_mutex). One, as before,
++// unless the headset's controllers play as two (SHADPS4_QUEST_MOVE=1).
++static std::vector<s32> g_move_handles;
+ static s32 g_gun_handle = -1;
+ static s32 g_hmd_handle = -1;
+ 
+@@ -69,6 +72,22 @@ static bool IsPlayersPad(s32 handle) {
+     return !g_pads.empty() && g_pads.front().handle == handle;
+ }
+ 
++static bool IsMove(s32 handle) {
++    std::scoped_lock lock{g_pads_mutex};
++    return std::ranges::find(g_move_handles, handle) != g_move_handles.end();
++}
++
++/// The wand a registered Move handle stands for: as libSceMove opened it, or else by the order
++/// of registration.
++static int MoveWandOf(s32 handle) {
++    if (const int wand = Libraries::Move::WandForHandle(handle); wand >= 0) {
++        return wand;
++    }
++    std::scoped_lock lock{g_pads_mutex};
++    const auto it = std::ranges::find(g_move_handles, handle);
++    return it == g_move_handles.end() ? -1 : static_cast<int>(it - g_move_handles.begin());
++}
++
+ static bool HeadsetConnected() {
+     return Core::Vr::Runtime::Instance().IsHeadsetConnected();
+ }
+@@ -379,10 +398,15 @@ s32 PS4_SYSV_ABI sceVrTrackerRegisterDeviceInternal(const OrbisVrTrackerDeviceTy
+         break;
+     }
+     case OrbisVrTrackerDeviceType::ORBIS_VR_TRACKER_DEVICE_MOVE: {
+-        if (g_move_handle != -1) {
++        const size_t most =
++            Core::Vr::Runtime::Instance().MoveWandsEnabled() ? Core::Vr::NumMoveWands : 1;
++        std::scoped_lock lock{g_pads_mutex};
++        if (std::ranges::find(g_move_handles, handle) != g_move_handles.end() ||
++            g_move_handles.size() >= most) {
+             return ORBIS_VR_TRACKER_ERROR_DEVICE_ALREADY_REGISTERED;
+         }
+-        g_move_handle = handle;
++        g_move_handles.push_back(handle);
++        LOG_INFO(Lib_VrTracker, "Move wand registered, handle {:#x}", handle);
+         break;
+     }
+     case OrbisVrTrackerDeviceType::ORBIS_VR_TRACKER_DEVICE_GUN: {
+@@ -431,7 +455,13 @@ s32 PS4_SYSV_ABI sceVrTrackerGetResult(const OrbisVrTrackerGetResultParam* param
+     const auto pad_registration = FindPad(handle);
+     // (Another player's controller is registered, but nothing tracks it.)
+     const bool is_pad = pad_registration.has_value() && IsPlayersPad(handle);
+-    if (!is_hmd && !pad_registration && handle != g_move_handle && handle != g_gun_handle) {
++    const bool is_move = !is_hmd && !pad_registration && IsMove(handle);
++    const int move_wand = is_move ? MoveWandOf(handle) : -1;
++    auto& runtime = Core::Vr::Runtime::Instance();
++    // A Move is tracked once the controller playing it has been seen.
++    const bool move_tracked =
++        is_move && move_wand >= 0 && runtime.MoveWandsEnabled() && runtime.GetMove(move_wand).tracked;
++    if (!is_hmd && !pad_registration && !is_move && handle != g_gun_handle) {
+         return ORBIS_VR_TRACKER_ERROR_DEVICE_NOT_REGISTERED;
+     }
+ 
+@@ -441,7 +471,7 @@ s32 PS4_SYSV_ABI sceVrTrackerGetResult(const OrbisVrTrackerGetResultParam* param
+     result->camera_orientation_w = 1.0f;
+ 
+     // Only the headset and the first controller are tracked by the host.
+-    if (!HeadsetConnected() || (!is_hmd && !is_pad)) {
++    if (!HeadsetConnected() || (!is_hmd && !is_pad && !move_tracked)) {
+         // DIAGNOSTIC (Rush of Blood, forced pause menu): say which device is reported as lost,
+         // and why. Logged the first 8 times per device, then every 2000th.
+         static std::mutex lost_mutex;
+@@ -456,7 +486,7 @@ s32 PS4_SYSV_ABI sceVrTrackerGetResult(const OrbisVrTrackerGetResultParam* param
+                             handle, n,
+                             is_hmd                   ? "headset"
+                             : pad_registration       ? (is_pad ? "players pad" : "other pad")
+-                            : handle == g_move_handle ? "Move"
++                            : is_move                 ? "Move"
+                                                       : "gun",
+                             HeadsetConnected());
+             }
+@@ -465,8 +495,9 @@ s32 PS4_SYSV_ABI sceVrTrackerGetResult(const OrbisVrTrackerGetResultParam* param
+         return ORBIS_OK;
+     }
+ 
+-    auto& runtime = Core::Vr::Runtime::Instance();
+-    Core::Vr::DeviceState state = is_hmd ? runtime.GetHead() : runtime.GetPad();
++    Core::Vr::DeviceState state = is_hmd    ? runtime.GetHead()
++                                  : is_move ? runtime.GetMove(move_wand)
++                                            : runtime.GetPad();
+     if (is_hmd) {
+         // DIAGNOSTIC (Rush of Blood, broken level geometry): feed the game a fixed head pose.
+         //   SHADPS4_HEAD_POSE=identity  -> position 0, no rotation
+@@ -505,8 +536,11 @@ s32 PS4_SYSV_ABI sceVrTrackerGetResult(const OrbisVrTrackerGetResultParam* param
+         OrbisVrTrackerRecalibrateNecessityType::ORBIS_VR_TRACKER_RECALIBRATE_NECESSITY_NOTHING;
+     result->playarea_brightness_risk =
+         OrbisVrTrackerPlayareaBrightnessRiskType::ORBIS_VR_TRACKER_PLAYAREA_BRIGHTNESS_RISK_LOW;
+-    result->led_color = is_pad ? pad_registration->color
+-                               : OrbisVrTrackerLedColor::ORBIS_VR_TRACKER_LED_COLOR_BLUE;
++    result->led_color = is_pad    ? pad_registration->color
++                        : is_move ? (move_wand == 0
++                                         ? OrbisVrTrackerLedColor::ORBIS_VR_TRACKER_LED_COLOR_BLUE
++                                         : OrbisVrTrackerLedColor::ORBIS_VR_TRACKER_LED_COLOR_RED)
++                                  : OrbisVrTrackerLedColor::ORBIS_VR_TRACKER_LED_COLOR_BLUE;
+     result->status = OrbisVrTrackerStatus::ORBIS_VR_TRACKER_STATUS_TRACKING;
+     result->position_quality = OrbisVrTrackerQuality::ORBIS_VR_TRACKER_QUALITY_FULL;
+     result->orientation_quality = OrbisVrTrackerQuality::ORBIS_VR_TRACKER_QUALITY_FULL;
+@@ -521,6 +555,10 @@ s32 PS4_SYSV_ABI sceVrTrackerGetResult(const OrbisVrTrackerGetResultParam* param
+         WritePose(result->pad_info.device_pose, state.pose);
+         return ORBIS_OK;
+     }
++    if (is_move) {
++        WritePose(result->move_info.device_pose, state.pose);
++        return ORBIS_OK;
++    }
+ 
+     auto& hmd = result->hmd_info;
+     WritePose(hmd.device_pose, state.pose);
+@@ -643,7 +681,8 @@ s32 PS4_SYSV_ABI sceVrTrackerRecalibrate(const OrbisVrTrackerRecalibrateParam* p
+         break;
+     }
+     case OrbisVrTrackerDeviceType::ORBIS_VR_TRACKER_DEVICE_MOVE: {
+-        if (g_move_handle == -1) {
++        std::scoped_lock lock{g_pads_mutex};
++        if (g_move_handles.empty()) {
+             return ORBIS_VR_TRACKER_ERROR_DEVICE_NOT_REGISTERED;
+         }
+         break;
+@@ -809,8 +848,9 @@ s32 PS4_SYSV_ABI sceVrTrackerUnregisterDevice(const s32 handle) {
+         // (The next registered, if any, is the player's from now on.)
+         std::scoped_lock lock{g_pads_mutex};
+         std::erase_if(g_pads, [&](const PadRegistration& pad) { return pad.handle == handle; });
+-    } else if (handle == g_move_handle) {
+-        g_move_handle = -1;
++    } else if (IsMove(handle)) {
++        std::scoped_lock lock{g_pads_mutex};
++        std::erase(g_move_handles, handle);
+     } else if (handle == g_gun_handle) {
+         g_gun_handle = -1;
+     } else {
+diff --git a/shadps4-arm64-main/src/core/vr/openxr_host.cpp b/shadps4-arm64-main/src/core/vr/openxr_host.cpp
+index 0c27be2..39f1b03 100644
+--- a/shadps4-arm64-main/src/core/vr/openxr_host.cpp
++++ b/shadps4-arm64-main/src/core/vr/openxr_host.cpp
+@@ -9,7 +9,9 @@
+ #include <cstdio>
+ #include <cstdlib>
+ #include <cstring>
++#include <initializer_list>
+ #include <mutex>
++#include <optional>
+ #include <thread>
+ 
+ #include <windows.h>
+@@ -355,6 +357,24 @@ struct OpenXrHost::Impl {
+     XrSpace grip_spaces[2]{XR_NULL_HANDLE, XR_NULL_HANDLE};
+     bool actions_ready{};
+     bool actions_synced{};
++    // With SHADPS4_QUEST_MOVE=1 the controllers are also the title's two Move wands: their
++    // buttons are read too, and the title's rumble goes to them.
++    bool move_wands{};
++    XrAction act_trigger{XR_NULL_HANDLE};
++    XrAction act_squeeze{XR_NULL_HANDLE};
++    XrAction act_lower{XR_NULL_HANDLE};   ///< A on the right, X on the left.
++    XrAction act_upper{XR_NULL_HANDLE};   ///< B on the right, Y on the left.
++    XrAction act_stick_click{XR_NULL_HANDLE};
++    XrAction act_stick{XR_NULL_HANDLE};
++    XrAction act_menu{XR_NULL_HANDLE};    ///< The left controller's only.
++    XrAction act_haptic{XR_NULL_HANDLE};
++    bool move_wand_seen[2]{};
++    u8 move_rumble_sent[2]{};
++    Clock::time_point move_rumble_time[2]{};
++    bool menu_down{};
++    bool menu_fired{};
++    Clock::time_point menu_since{};
++    Clock::time_point start_until{};
+     XrVector3f grip_rest{};
+     Clock::time_point grip_moved{};
+     // What the gamepad is placed by: 0 nothing, 1 the joints of the hands, 2 the above.
+@@ -683,10 +703,11 @@ struct OpenXrHost::Impl {
+             DestroySession();
+             return false;
+         }
+-        if (has_hand_tracking) {
++        // (Move wands are the controllers themselves: the hands around a gamepad mean nothing.)
++        if (has_hand_tracking && !move_wands) {
+             CreateHandTrackers();
+         }
+-        if (use_grips) {
++        if (use_grips || move_wands) {
+             CreateActions();
+         }
+         if (has_refresh_rate) {
+@@ -733,8 +754,44 @@ struct OpenXrHost::Impl {
+         }
+     }
+ 
++    /// The buttons, sticks and rumble of the headset's controllers, for the Move wands. All in
++    /// the action set CreateActions makes, for both hands.
++    bool CreateMoveActions() {
++        const auto make = [&](XrAction& action, const char* name, const char* localized,
++                              XrActionType type) {
++            XrActionCreateInfo info{XR_TYPE_ACTION_CREATE_INFO};
++            std::strcpy(info.actionName, name);
++            std::strcpy(info.localizedActionName, localized);
++            info.actionType = type;
++            info.countSubactionPaths = 2;
++            info.subactionPaths = hand_paths;
++            if (XR_FAILED(xrCreateAction(action_set, &info, &action))) {
++                action = XR_NULL_HANDLE;
++                LOG_WARNING(Core_Vr, "The controllers' {} could not be asked for", localized);
++                return false;
++            }
++            return true;
++        };
++        bool made = true;
++        made &= make(act_trigger, "move_t", "Move T (trigger)", XR_ACTION_TYPE_FLOAT_INPUT);
++        made &= make(act_squeeze, "move_move", "Move MOVE button (grip)",
++                     XR_ACTION_TYPE_FLOAT_INPUT);
++        made &= make(act_lower, "move_cross", "Move cross (A/X)", XR_ACTION_TYPE_BOOLEAN_INPUT);
++        made &= make(act_upper, "move_circle", "Move circle (B/Y)", XR_ACTION_TYPE_BOOLEAN_INPUT);
++        made &= make(act_stick_click, "move_square", "Move square (stick click)",
++                     XR_ACTION_TYPE_BOOLEAN_INPUT);
++        made &= make(act_stick, "move_stick", "Move triangle and select (stick up and down)",
++                     XR_ACTION_TYPE_VECTOR2F_INPUT);
++        made &= make(act_menu, "move_start", "Move START (menu)", XR_ACTION_TYPE_BOOLEAN_INPUT);
++        made &= make(act_haptic, "move_rumble", "Move rumble", XR_ACTION_TYPE_VIBRATION_OUTPUT);
++        if (!made) {
++            LOG_WARNING(Core_Vr, "The Move wands get no buttons: the controllers only place them");
++        }
++        return made;
++    }
++
+     /// Lets the headset's runtime say where its controllers are, for LocateGrip. (They are not
+-    /// the title's gamepad: nothing of what they do is read.)
++    /// the title's gamepad: nothing of what they do is read, unless they are its Move wands.)
+     void CreateActions() {
+         actions_ready = false;
+         XrActionSetCreateInfo set_info{XR_TYPE_ACTION_SET_CREATE_INFO};
+@@ -766,6 +823,23 @@ struct OpenXrHost::Impl {
+         };
+         bind(act_grip, "/user/hand/left/input/grip/pose");
+         bind(act_grip, "/user/hand/right/input/grip/pose");
++        if (move_wands && CreateMoveActions()) {
++            bind(act_trigger, "/user/hand/left/input/trigger/value");
++            bind(act_trigger, "/user/hand/right/input/trigger/value");
++            bind(act_squeeze, "/user/hand/left/input/squeeze/value");
++            bind(act_squeeze, "/user/hand/right/input/squeeze/value");
++            bind(act_lower, "/user/hand/left/input/x/click");
++            bind(act_lower, "/user/hand/right/input/a/click");
++            bind(act_upper, "/user/hand/left/input/y/click");
++            bind(act_upper, "/user/hand/right/input/b/click");
++            bind(act_stick_click, "/user/hand/left/input/thumbstick/click");
++            bind(act_stick_click, "/user/hand/right/input/thumbstick/click");
++            bind(act_stick, "/user/hand/left/input/thumbstick");
++            bind(act_stick, "/user/hand/right/input/thumbstick");
++            bind(act_menu, "/user/hand/left/input/menu/click");
++            bind(act_haptic, "/user/hand/left/output/haptic");
++            bind(act_haptic, "/user/hand/right/output/haptic");
++        }
+         XrInteractionProfileSuggestedBinding suggested{
+             XR_TYPE_INTERACTION_PROFILE_SUGGESTED_BINDING};
+         xrStringToPath(instance, "/interaction_profiles/oculus/touch_controller",
+@@ -898,6 +972,19 @@ struct OpenXrHost::Impl {
+             xrDestroyActionSet(action_set);
+             action_set = XR_NULL_HANDLE;
+         }
++        for (XrAction* action : {&act_trigger, &act_squeeze, &act_lower, &act_upper,
++                                 &act_stick_click, &act_stick, &act_menu, &act_haptic}) {
++            *action = XR_NULL_HANDLE;
++        }
++        for (int wand = 0; wand < 2; ++wand) {
++            if (move_wand_seen[wand]) {
++                Runtime::Instance().LoseMove(wand);
++            }
++            move_wand_seen[wand] = false;
++            move_rumble_sent[wand] = 0;
++        }
++        menu_down = false;
++        menu_fired = false;
+         if (local_space != XR_NULL_HANDLE) {
+             xrDestroySpace(local_space);
+             local_space = XR_NULL_HANDLE;
+@@ -1176,7 +1263,11 @@ struct OpenXrHost::Impl {
+                 static_cast<XrTime>(std::clamp(predict_ms, 0.0f, 80.0f) * 1e6f);
+             UpdateHead(pose_time);
+             SyncActions();
+-            UpdatePad(pose_time);
++            if (move_wands) {
++                UpdateMoves(pose_time);
++            } else {
++                UpdatePad(pose_time);
++            }
+ 
+             if (const s32 index = TakeFrame(); index >= 0) {
+                 const auto started = Clock::now();
+@@ -1505,6 +1596,189 @@ struct OpenXrHost::Impl {
+         }
+     }
+ 
++    // ---- The Move wands --------------------------------------------------------------------
++
++    float ReadFloat(XrAction action, int hand) {
++        if (action == XR_NULL_HANDLE) {
++            return 0.0f;
++        }
++        XrActionStateGetInfo get{XR_TYPE_ACTION_STATE_GET_INFO};
++        get.action = action;
++        get.subactionPath = hand_paths[hand];
++        XrActionStateFloat state{XR_TYPE_ACTION_STATE_FLOAT};
++        if (XR_FAILED(xrGetActionStateFloat(session, &get, &state)) ||
++            state.isActive != XR_TRUE) {
++            return 0.0f;
++        }
++        return state.currentState;
++    }
++
++    bool ReadBool(XrAction action, int hand) {
++        if (action == XR_NULL_HANDLE) {
++            return false;
++        }
++        XrActionStateGetInfo get{XR_TYPE_ACTION_STATE_GET_INFO};
++        get.action = action;
++        get.subactionPath = hand_paths[hand];
++        XrActionStateBoolean state{XR_TYPE_ACTION_STATE_BOOLEAN};
++        if (XR_FAILED(xrGetActionStateBoolean(session, &get, &state)) ||
++            state.isActive != XR_TRUE) {
++            return false;
++        }
++        return state.currentState == XR_TRUE;
++    }
++
++    XrVector2f ReadStick(int hand) {
++        if (act_stick == XR_NULL_HANDLE) {
++            return {};
++        }
++        XrActionStateGetInfo get{XR_TYPE_ACTION_STATE_GET_INFO};
++        get.action = act_stick;
++        get.subactionPath = hand_paths[hand];
++        XrActionStateVector2f state{XR_TYPE_ACTION_STATE_VECTOR2F};
++        if (XR_FAILED(xrGetActionStateVector2f(session, &get, &state)) ||
++            state.isActive != XR_TRUE) {
++            return {};
++        }
++        return state.currentState;
++    }
++
++    /// Where the controller of a hand is, how it is turned and how it moves, in host space.
++    std::optional<DeviceState> LocateGripPose(int hand, XrTime time) {
++        if (grip_spaces[hand] == XR_NULL_HANDLE) {
++            return std::nullopt;
++        }
++        XrActionStateGetInfo get{XR_TYPE_ACTION_STATE_GET_INFO};
++        get.action = act_grip;
++        get.subactionPath = hand_paths[hand];
++        XrActionStatePose pose{XR_TYPE_ACTION_STATE_POSE};
++        if (XR_FAILED(xrGetActionStatePose(session, &get, &pose)) || pose.isActive != XR_TRUE) {
++            return std::nullopt;
++        }
++        XrSpaceVelocity velocity{XR_TYPE_SPACE_VELOCITY};
++        XrSpaceLocation location{XR_TYPE_SPACE_LOCATION};
++        location.next = &velocity;
++        static constexpr XrSpaceLocationFlags Needed =
++            XR_SPACE_LOCATION_POSITION_VALID_BIT | XR_SPACE_LOCATION_ORIENTATION_VALID_BIT |
++            XR_SPACE_LOCATION_POSITION_TRACKED_BIT;
++        if (XR_FAILED(xrLocateSpace(grip_spaces[hand], local_space, time, &location)) ||
++            (location.locationFlags & Needed) != Needed) {
++            return std::nullopt;
++        }
++        DeviceState state;
++        state.pose.position = {location.pose.position.x, location.pose.position.y,
++                               location.pose.position.z};
++        state.pose.orientation =
++            Normalize({location.pose.orientation.x, location.pose.orientation.y,
++                       location.pose.orientation.z, location.pose.orientation.w});
++        if ((velocity.velocityFlags & XR_SPACE_VELOCITY_LINEAR_VALID_BIT) != 0) {
++            state.linear_velocity = {velocity.linearVelocity.x, velocity.linearVelocity.y,
++                                     velocity.linearVelocity.z};
++        }
++        if ((velocity.velocityFlags & XR_SPACE_VELOCITY_ANGULAR_VALID_BIT) != 0) {
++            state.angular_velocity = {velocity.angularVelocity.x, velocity.angularVelocity.y,
++                                      velocity.angularVelocity.z};
++        }
++        state.tracked = true;
++        return state;
++    }
++
++    /// The right controller is the first wand, the left the second. Trigger = T, grip = MOVE,
++    /// A/X = cross, B/Y = circle, stick click = square, stick up = triangle, stick down =
++    /// select, the left menu button = START when tapped (held for a second it resets the view).
++    void UpdateMoves(XrTime time) {
++        auto& runtime = Runtime::Instance();
++        const auto now = Clock::now();
++        // The menu button is START when it is let go of within a second, and resets the view
++        // when it is held longer (the title then sees no START, so its pause menu stays shut).
++        const bool menu = actions_synced && ReadBool(act_menu, 0);
++        if (menu && !menu_down) {
++            menu_since = now;
++            menu_fired = false;
++        }
++        if (menu && !menu_fired && now - menu_since > std::chrono::seconds{1}) {
++            menu_fired = true;
++            LOG_INFO(Core_Vr, "Menu button held: the view is reset");
++            runtime.RequestRecenter();
++        }
++        if (!menu && menu_down && !menu_fired) {
++            start_until = now + std::chrono::milliseconds{120};
++        }
++        menu_down = menu;
++        const bool start = now < start_until;
++
++        for (int wand = 0; wand < 2; ++wand) {
++            const int hand = wand == 0 ? 1 : 0;
++            MoveInput input;
++            if (actions_synced) {
++                namespace B = MoveButtons;
++                const float trigger = std::clamp(ReadFloat(act_trigger, hand), 0.0f, 1.0f);
++                input.trigger = static_cast<u8>(std::lround(trigger * 255.0f));
++                const XrVector2f stick = ReadStick(hand);
++                const auto press = [&](bool pressed, u16 button) {
++                    if (pressed) {
++                        input.buttons |= button;
++                    }
++                };
++                // (The console's T reads as pressed a little before the trigger bottoms out.)
++                press(trigger > 0.85f, B::T);
++                press(ReadFloat(act_squeeze, hand) > 0.5f, B::Move);
++                press(ReadBool(act_lower, hand), B::Cross);
++                press(ReadBool(act_upper, hand), B::Circle);
++                press(ReadBool(act_stick_click, hand), B::Square);
++                press(stick.y > 0.7f, B::Triangle);
++                press(stick.y < -0.7f, B::Select);
++                press(start, B::Start);
++            }
++
++            const std::optional<DeviceState> pose =
++                actions_synced ? LocateGripPose(hand, time) : std::nullopt;
++            if (pose) {
++                runtime.UpdateMove(wand, *pose, input);
++                if (!move_wand_seen[wand]) {
++                    LOG_INFO(Core_Vr, "Move wand {} is the {} controller", wand + 1,
++                             hand == 1 ? "right" : "left");
++                }
++                move_wand_seen[wand] = true;
++            } else {
++                if (move_wand_seen[wand]) {
++                    LOG_INFO(Core_Vr, "Move wand {} ({} controller) is out of sight", wand + 1,
++                             hand == 1 ? "right" : "left");
++                    runtime.LoseMove(wand);
++                }
++                move_wand_seen[wand] = false;
++                // Buttons still count while the controller cannot be seen.
++                if (actions_synced) {
++                    runtime.UpdateMoveInput(wand, input);
++                }
++            }
++
++            // The title's rumble. A Move's motor keeps going until told otherwise; a haptic
++            // pulse ends by itself, so it is renewed while the title wants it.
++            const u8 rumble = runtime.GetMoveVibration(wand);
++            if (act_haptic == XR_NULL_HANDLE || !actions_synced) {
++                continue;
++            }
++            XrHapticActionInfo haptic_info{XR_TYPE_HAPTIC_ACTION_INFO};
++            haptic_info.action = act_haptic;
++            haptic_info.subactionPath = hand_paths[hand];
++            if (rumble > 0 && (rumble != move_rumble_sent[wand] ||
++                               now - move_rumble_time[wand] > std::chrono::milliseconds{60})) {
++                XrHapticVibration vibration{XR_TYPE_HAPTIC_VIBRATION};
++                vibration.amplitude = static_cast<float>(rumble) / 255.0f;
++                vibration.duration = 100'000'000; // 100 ms, renewed before it runs out.
++                vibration.frequency = XR_FREQUENCY_UNSPECIFIED;
++                xrApplyHapticFeedback(session, &haptic_info,
++                                      reinterpret_cast<const XrHapticBaseHeader*>(&vibration));
++                move_rumble_sent[wand] = rumble;
++                move_rumble_time[wand] = now;
++            } else if (rumble == 0 && move_rumble_sent[wand] != 0) {
++                xrStopHapticFeedback(session, &haptic_info);
++                move_rumble_sent[wand] = 0;
++            }
++        }
++    }
++
+     // --- pictures -----------------------------------------------------------------------------
+ 
+     /// The newest finished frame that has not been shown yet, marked as being read; -1 for none.
+@@ -2050,6 +2324,7 @@ bool OpenXrHost::Connect() {
+     impl->predict_ms = EnvFloat("SHADPS4_XR_PREDICT_MS", 20.0f);
+     impl->lose_after = EnvFloat("SHADPS4_XR_LOSE_AFTER", 0.0f);
+     impl->pause_when_away = EnvFlag("SHADPS4_XR_PAUSE", true);
++    impl->move_wands = Runtime::Instance().MoveWandsEnabled();
+     if (const char* unwanted = std::getenv("SHADPS4_XR_UNWANTED"); unwanted != nullptr) {
+         std::sscanf(unwanted, "%f,%f", &impl->unwanted_from, &impl->unwanted_to);
+     }
+diff --git a/shadps4-arm64-main/src/core/vr/vr_runtime.cpp b/shadps4-arm64-main/src/core/vr/vr_runtime.cpp
+index 2c16201..a09c6fa 100644
+--- a/shadps4-arm64-main/src/core/vr/vr_runtime.cpp
++++ b/shadps4-arm64-main/src/core/vr/vr_runtime.cpp
+@@ -193,7 +193,32 @@ FileConfig LoadFileConfig() {
+ 
+ } // namespace
+ 
+-Runtime::Runtime() = default;
++Runtime::Runtime() {
++    // The Move wands are asked for by libSceMove as the title starts, before Configure: they
++    // are set up from the environment the launcher gives the emulator, here.
++    bool flag = false;
++    move_config.enabled = EnvFlag("SHADPS4_QUEST_MOVE", flag) && flag;
++    const auto env_float = [](const char* name, float fallback, float low, float high) {
++        const char* value = std::getenv(name);
++        if (value == nullptr || *value == '\0') {
++            return fallback;
++        }
++        return std::clamp(static_cast<float>(std::atof(value)), low, high);
++    };
++    move_config.pitch_degrees =
++        env_float("SHADPS4_QUEST_MOVE_PITCH", move_config.pitch_degrees, -90.0f, 90.0f);
++    move_config.reach = env_float("SHADPS4_QUEST_MOVE_SCALE", move_config.reach, 0.05f, 1.5f);
++    move_config.turn = env_float("SHADPS4_QUEST_MOVE_TURN", move_config.turn, 0.05f, 1.5f);
++    move_config.sphere_ahead =
++        env_float("SHADPS4_QUEST_MOVE_SPHERE", move_config.sphere_ahead, 0.0f, 0.3f);
++    if (move_config.enabled) {
++        LOG_INFO(Core_Vr,
++                 "Move wands from the headset's controllers: aim raised {:.0f} degrees, reach "
++                 "{:.0f}%, turning {:.0f}%, sphere {:.0f} mm ahead of the hand",
++                 move_config.pitch_degrees, move_config.reach * 100.0f, move_config.turn * 100.0f,
++                 move_config.sphere_ahead * 1000.0f);
++    }
++}
+ 
+ Runtime& Runtime::Instance() {
+     static Runtime instance;
+@@ -871,6 +896,134 @@ DeviceState Runtime::GetPad() {
+     return state;
+ }
+ 
++void Runtime::UpdateMove(int wand, const DeviceState& host_state, const MoveInput& input) {
++    if (wand < 0 || wand >= NumMoveWands) {
++        return;
++    }
++    std::scoped_lock lock{mutex};
++    MoveWand& w = move_wands[wand];
++    const u64 sequence = w.host.sequence + 1;
++    w.host = host_state;
++    w.host.sequence = sequence;
++    w.host.tracked = true;
++    w.input = input;
++    w.seen = true;
++    w.lost = false;
++    w.seen_time = std::chrono::steady_clock::now();
++}
++
++void Runtime::UpdateMoveInput(int wand, const MoveInput& input) {
++    if (wand < 0 || wand >= NumMoveWands) {
++        return;
++    }
++    std::scoped_lock lock{mutex};
++    move_wands[wand].input = input;
++}
++
++void Runtime::LoseMove(int wand) {
++    if (wand < 0 || wand >= NumMoveWands) {
++        return;
++    }
++    std::scoped_lock lock{mutex};
++    // It stays where it was last seen (as a Move out of the camera's sight does), and lets go
++    // of its buttons.
++    move_wands[wand].input = {};
++    move_wands[wand].lost = true;
++    move_wands[wand].host.linear_velocity = {};
++    move_wands[wand].host.angular_velocity = {};
++}
++
++void Runtime::SetMoveVibration(int wand, u8 intensity) {
++    if (wand < 0 || wand >= NumMoveWands) {
++        return;
++    }
++    std::scoped_lock lock{mutex};
++    move_wands[wand].vibration = intensity;
++}
++
++u8 Runtime::GetMoveVibration(int wand) const {
++    if (wand < 0 || wand >= NumMoveWands) {
++        return 0;
++    }
++    std::scoped_lock lock{mutex};
++    return move_wands[wand].vibration;
++}
++
++void Runtime::SetMoveLight(int wand, u8 red, u8 green, u8 blue) {
++    if (wand < 0 || wand >= NumMoveWands) {
++        return;
++    }
++    std::scoped_lock lock{mutex};
++    move_wands[wand].light[0] = red;
++    move_wands[wand].light[1] = green;
++    move_wands[wand].light[2] = blue;
++}
++
++MoveInput Runtime::GetMoveInput(int wand) const {
++    if (wand < 0 || wand >= NumMoveWands) {
++        return {};
++    }
++    std::scoped_lock lock{mutex};
++    return move_wands[wand].input;
++}
++
++DeviceState Runtime::GetMove(int wand) {
++    DeviceState state;
++    if (wand < 0 || wand >= NumMoveWands) {
++        return state;
++    }
++    std::scoped_lock lock{mutex};
++    const MoveWand& w = move_wands[wand];
++    if (!w.seen) {
++        return state;
++    }
++
++    // Into tracker space, as the controller is.
++    const Vec3 grip = PositionToTracker(w.host.pose.position);
++    Quat orientation = Normalize(Multiply(Conjugate(seat_yaw), w.host.pose.orientation));
++
++    // A Touch controller's grip points along the handle, which leans forward from where the
++    // hand aims: the wand is raised by that much, about its own sideways axis.
++    const float pitch = move_config.pitch_degrees * 3.14159265f / 180.0f;
++    orientation = Normalize(Multiply(orientation, FromAxisAngle({1.0f, 0.0f, 0.0f}, pitch)));
++
++    const DeviceState& current_head = head.sequence == 0 ? DemoHead() : head;
++
++    // Turning, scaled about "level and facing the way the head faces".
++    const Quat facing = YawOnly(current_head.pose.orientation);
++    Quat relative = Normalize(Multiply(Conjugate(facing), orientation));
++    if (relative.w < 0.0f) {
++        relative = {-relative.x, -relative.y, -relative.z, -relative.w};
++    }
++    const float half = std::acos(std::clamp(relative.w, -1.0f, 1.0f));
++    const float sin_half = std::sin(half);
++    if (sin_half > 1e-5f) {
++        const Vec3 axis{relative.x / sin_half, relative.y / sin_half, relative.z / sin_half};
++        relative = FromAxisAngle(axis, 2.0f * half * move_config.turn);
++    }
++    orientation = Normalize(Multiply(facing, relative));
++
++    // Reach, scaled about the head; the sphere the console tracks sits at the far end of the
++    // wand, ahead of the hand the way the wand now points.
++    const Vec3& from = current_head.pose.position;
++    const Vec3 ahead = Rotate(orientation, {0.0f, 0.0f, -move_config.sphere_ahead});
++    state.pose.position = {from.x + (grip.x - from.x) * move_config.reach + ahead.x,
++                           from.y + (grip.y - from.y) * move_config.reach + ahead.y,
++                           from.z + (grip.z - from.z) * move_config.reach + ahead.z};
++    state.pose.orientation = orientation;
++    const Vec3 velocity = DirectionToTracker(w.host.linear_velocity);
++    state.linear_velocity = {velocity.x * move_config.reach, velocity.y * move_config.reach,
++                             velocity.z * move_config.reach};
++    const Vec3 spin = DirectionToTracker(w.host.angular_velocity);
++    state.angular_velocity = {spin.x * move_config.turn, spin.y * move_config.turn,
++                              spin.z * move_config.turn};
++    state.sequence = w.host.sequence;
++    // Sight of a controller comes and goes for a frame or two: only a longer loss counts.
++    state.tracked = !w.lost || std::chrono::steady_clock::now() - w.seen_time <
++                                   std::chrono::milliseconds{300};
++    return state;
++}
++
+ Pose Runtime::ToHostSpace(const Pose& tracker_pose) const {
+     std::scoped_lock lock{mutex};
+     const auto from_seat = [&](const Vec3& position, const Quat& yaw) {
+diff --git a/shadps4-arm64-main/src/core/vr/vr_runtime.h b/shadps4-arm64-main/src/core/vr/vr_runtime.h
+index 45f1502..3d86a1d 100644
+--- a/shadps4-arm64-main/src/core/vr/vr_runtime.h
++++ b/shadps4-arm64-main/src/core/vr/vr_runtime.h
+@@ -71,6 +71,46 @@ struct PadFeedback {
+     bool operator==(const PadFeedback&) const = default;
+ };
+ 
++/// The two PlayStation Move wands, played with the headset's own controllers
++/// (SHADPS4_QUEST_MOVE=1). Wand 0 is the first the title opens: the right hand. Wand 1 is the left.
++constexpr int NumMoveWands = 2;
++
++/// Buttons of a Move wand, as libSceMove reports them (the layout of the PS3's libgem, which
++/// libSceMove kept).
++namespace MoveButtons {
++constexpr u16 Select = 1u << 0;
++constexpr u16 T = 1u << 1;
++constexpr u16 Move = 1u << 2;
++constexpr u16 Start = 1u << 3;
++constexpr u16 Triangle = 1u << 4;
++constexpr u16 Circle = 1u << 5;
++constexpr u16 Cross = 1u << 6;
++constexpr u16 Square = 1u << 7;
++} // namespace MoveButtons
++
++/// What a wand's buttons and trigger say, from the host.
++struct MoveInput {
++    u16 buttons{};
++    u8 trigger{}; ///< 0 released to 255 fully pulled.
++};
++
++/// How the headset's controllers are turned into wands. The values are those the launcher
++/// recommends; SHADPS4_QUEST_MOVE_PITCH (degrees), SHADPS4_QUEST_MOVE_SCALE and
++/// SHADPS4_QUEST_MOVE_TURN (fractions) replace them.
++struct MoveConfig {
++    bool enabled{false};
++    /// How far the wand is raised above the way the controller's grip points. A Touch
++    /// controller's handle is tilted down from where the hand points.
++    float pitch_degrees{35.0f};
++    /// How far the wand moves when the hand does, measured from the head (1 = as far).
++    float reach{0.55f};
++    /// How far the wand turns when the hand does, measured from level and facing where the
++    /// head faces (1 = as far).
++    float turn{0.65f};
++    /// The sphere a Move is tracked by sits at the end of the wand, ahead of the hand.
++    float sphere_ahead{0.06f};
++};
++
+ /// Everything the host needs to put one emulated HMD frame in front of the user's eyes.
+ struct PresentedFrame {
+     u32 id{};         ///< Matches the marker the presenter stamps into the frame.
+@@ -215,9 +255,30 @@ public:
+     /// tells of its refreshes, as often as Config::refresh_rate says otherwise.
+     float HeadsetRefreshRate() const;
+ 
++    // The Move wands (see MoveConfig). Host side: where the controller of that hand is and what
++    // its buttons say, in host space; LoseMove when the host no longer sees it.
++    const MoveConfig& GetMoveConfig() const {
++        return move_config;
++    }
++    bool MoveWandsEnabled() const {
++        return move_config.enabled;
++    }
++    void UpdateMove(int wand, const DeviceState& host_state, const MoveInput& input);
++    void UpdateMoveInput(int wand, const MoveInput& input);
++    void LoseMove(int wand);
++    /// What the title wants a wand to do: its rumble (0 to 255) and the colour of its sphere.
++    void SetMoveVibration(int wand, u8 intensity);
++    u8 GetMoveVibration(int wand) const;
++    void SetMoveLight(int wand, u8 red, u8 green, u8 blue);
++
+     // Guest side, tracker space.
+     DeviceState GetHead();
+     DeviceState GetPad();
++    /// A wand's place and how it is turned, as the title is to see it (MoveConfig applied).
++    /// `tracked` is false until the host has seen that controller, and once it has been out of
++    /// sight for a moment (the wand then stays where it was last seen).
++    DeviceState GetMove(int wand);
++    MoveInput GetMoveInput(int wand) const;
+ 
+     /// Converts a tracker-space pose handed back by the guest into host space.
+     Pose ToHostSpace(const Pose& tracker_pose) const;
+@@ -295,6 +356,18 @@ private:
+     std::condition_variable headset_fov_known;
+     Fov headset_fov;
+     bool has_headset_fov{};
++    // The Move wands, guarded by `mutex`.
++    struct MoveWand {
++        DeviceState host; ///< As the host last gave it, host space.
++        MoveInput input;
++        bool seen{};  ///< Ever.
++        bool lost{};  ///< Out of the host's sight since it was last seen.
++        std::chrono::steady_clock::time_point seen_time;
++        u8 vibration{};
++        u8 light[3]{};
++    };
++    MoveConfig move_config;
++    MoveWand move_wands[NumMoveWands];
+     PadFeedback pad_feedback;
+     std::function<void(const PadFeedback&)> pad_feedback_listener;
+     std::function<void(const PresentedFrame&)> frame_listener;
+diff --git a/tools/make-release.ps1 b/tools/make-release.ps1
+index 2888965..c2fb0ff 100644
+--- a/tools/make-release.ps1
++++ b/tools/make-release.ps1
+@@ -29,11 +29,7 @@ function Need([string]$path, [string]$what) {
+     if (-not (Test-Path -LiteralPath $path)) { throw "Missing ${what}: $path" }
+ }
+ Need $Exe "emulator (build it first, see the top of this script)"
+-# The free emulator must not have the Motion (paid) Quest/Move code in it: the build folder holds
+-# the paid exe after a paid build. Build from main again, or pass the free exe with -Exe.
+-if ([Text.Encoding]::GetEncoding(28591).GetString([IO.File]::ReadAllBytes($Exe)).Contains("SHADPS4_QUEST_MOVE")) {
+-    throw "$Exe has the paid Quest/Move code in it (it was built on the paid-build branch). Build the free emulator from main: git checkout main, then cmake --build shadps4-arm64-main\Build\x64-Clang-Release --target shadps4 (or give the free exe with -Exe)."
+-}
++# (This fork has its own Quest/Move support built in, so its emulator carries SHADPS4_QUEST_MOVE.)
+ foreach ($name in "PkgTool.exe", "LibOrbisPkg.dll", "LICENSE.txt") {
+     Need (Join-Path $PkgToolDir $name) "PkgTool file (see the top of this script)"
+ }
+-- 
+2.43.0
+

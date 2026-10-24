@@ -1,0 +1,70 @@
+From f98a41b89155987539b6258f90d11bd5d6aae4b3 Mon Sep 17 00:00:00 2001
+From: RushVR Move fork <noreply@anthropic.com>
+Date: Sat, 24 Oct 2026 16:01:17 +0100
+Subject: [PATCH] Let the Move aim angle go below zero, recommend -55 / 100% /
+ 100%
+
+With turning at 100% the Quest grip's own upward lean showed: at +35 degrees the guns pointed
+straight up. The aim slider now runs from -90 to 90 (the emulator already accepted that), and
+the recommended values are an aim of -55 degrees with reach and turning at 100%, so the guns
+follow the hands one to one.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_018kCR2zyXAcmfP8xMfMVWtk
+---
+ pc-vr/launch.ps1   | 12 ++++++------
+ pc-vr/settings.txt |  9 +++++----
+ 2 files changed, 11 insertions(+), 10 deletions(-)
+
+diff --git a/pc-vr/launch.ps1 b/pc-vr/launch.ps1
+index 5edaf89..4828ea6 100644
+--- a/pc-vr/launch.ps1
++++ b/pc-vr/launch.ps1
+@@ -1978,15 +1978,15 @@ function Show-MenuModern {
+         $moveOn.Enabled = $motionEdition
+         $moveCard.Controls.Add($moveOn)
+         $tips.SetToolTip($moveOn, "Plays with the Quest controllers, as the game's two PlayStation Move wands, instead of the DualSense. In the game's start-up question choose the Move controllers. Unplug the DualSense first: the game uses it instead when it is connected.")
+-        $moveDefaults = @(35, 55, 65)
++        $moveDefaults = @(-55, 100, 100)
+         $moveKeys = @("move_pitch", "move_reach", "move_turn")
+         $moveTitles = @("Aim angle", "Reach", "Turning")
+-        $moveLimits = @(@(0, 90), @(5, 130), @(5, 130))
+-        $moveUnits = @(" degrees up", "%", "%")
++        $moveLimits = @(@(-90, 90), @(5, 130), @(5, 130))
++        $moveUnits = @(" degrees", "%", "%")
+         $moveTips = @(
+-            "Raises the in-game gun from the way the Quest controller points. A Quest controller's handle is tilted down from where you point it, so with 0 the guns follow the handle and point lower than you aim. Raise it if they point down when your controller is straight ahead, lower it if they point up. Recommended: 35.",
+-            "How far the in-game hands move when you move yours, measured from your head. 100% is as far as you really move. Lower it if the hands move too much. Recommended: 55%.",
+-            "How much the in-game guns turn when you turn your wrist, measured from level and facing where you face. 100% is as far as you really turn. Lower it if the aim is too touchy. Recommended: 65%."
++            "Tilts the in-game gun from the way the Quest controller's grip is turned: above 0 raises it, below 0 lowers it. The grip of a Quest controller leans up and back from where you point, so the guns need lowering. Lower it if they point up when your controller is straight ahead, raise it if they point down. Recommended: -55.",
++            "How far the in-game hands move when you move yours, measured from your head. 100% is as far as you really move. Lower it if the hands move too much. Recommended: 100%.",
++            "How much the in-game guns turn when you turn your wrist. 100% is as far as you really turn, so that the guns point where you point. Recommended: 100%."
+         )
+         $moveSliders = @()
+         $moveValues = @()
+diff --git a/pc-vr/settings.txt b/pc-vr/settings.txt
+index aea5d59..06481b4 100644
+--- a/pc-vr/settings.txt
++++ b/pc-vr/settings.txt
+@@ -138,13 +138,14 @@
+ #controllers=dualsense
+ 
+ # The Quest controllers as Move wands, set by three sliders in the window: move_pitch, how
+-# far the in-game guns are raised above the way the controller points, in degrees (0 to 90);
++# far the in-game guns are tilted from the way the controller's grip is turned, in degrees (-90
++# to 90, below 0 lowers them: a Quest controller's grip leans up from where you point);
+ # move_reach, how far the in-game hands move when yours do, in percent of your own movement (5 to
+ # 130); and move_turn, how far the guns turn when you turn your wrist, in percent (5 to 130).
+ # Used only with controllers=quest. The window's recommended values:
+-#move_pitch=35
+-#move_reach=55
+-#move_turn=65
++#move_pitch=-55
++#move_reach=100
++#move_turn=100
+ 
+ # 1: a performance trace, for finding out what holds the frame rate back. The emulator writes
+ # perf_frames.csv (a row for every frame the game shows: its time, the GPU's, shader compiles,
+-- 
+2.43.0
+

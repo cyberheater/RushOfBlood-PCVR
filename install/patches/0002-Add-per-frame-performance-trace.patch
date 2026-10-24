@@ -1,0 +1,1267 @@
+From e2637a3e7505407c7255139a14829b2838fa03ad Mon Sep 17 00:00:00 2001
+From: RushVR perf trace <noreply@anthropic.com>
+Date: Sat, 24 Oct 2026 15:51:52 +0100
+Subject: [PATCH] Add a per-frame performance trace (perf_trace=1)
+
+SHADPS4_PERF_TRACE=1 (perf_trace=1 in pc-vr\settings.txt) writes two CSV files into
+pc-vr\user\log, independently of the log: perf_frames.csv, one row a presented frame (frame
+time, the game's own CPU time, the GPU thread's CPU time, GPU time from Vulkan timestamp
+queries, waits for the GPU, shader and pipeline compile time and counts, draws, passes,
+submits), and perf_headset.csv, one row a headset refresh (new frame or repeated, xrWaitFrame
+and xrEndFrame times). tools/perf-report.py sums them up and says what most likely limits the
+frame rate (GPU, emulator CPU, game CPU, compile stutter, judder).
+
+Also makes FrameStats::ThreadTime work on Windows (it returned 0), from the thread's cycle
+count, so the GPU thread's CPU time is measured there too. Nothing changes while the variable
+is not set.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_018kCR2zyXAcmfP8xMfMVWtk
+---
+ pc-vr/launch.ps1                              |   7 +
+ pc-vr/settings.txt                            |   7 +
+ shadps4-arm64-main/CMakeLists.txt             |   2 +
+ shadps4-arm64-main/src/common/perf_trace.cpp  | 270 +++++++++++++++
+ shadps4-arm64-main/src/common/perf_trace.h    |  76 +++++
+ .../src/core/vr/openxr_host.cpp               |  30 +-
+ .../video_core/renderer_vulkan/vk_instance.h  |   5 +
+ .../renderer_vulkan/vk_pipeline_cache.cpp     |  36 ++
+ .../renderer_vulkan/vk_presenter.cpp          |   3 +
+ .../renderer_vulkan/vk_scheduler.cpp          | 129 +++++++-
+ .../video_core/renderer_vulkan/vk_scheduler.h |  34 ++
+ tools/perf-report.py                          | 308 ++++++++++++++++++
+ 12 files changed, 895 insertions(+), 12 deletions(-)
+ create mode 100644 shadps4-arm64-main/src/common/perf_trace.cpp
+ create mode 100644 shadps4-arm64-main/src/common/perf_trace.h
+ create mode 100644 tools/perf-report.py
+
+diff --git a/pc-vr/launch.ps1 b/pc-vr/launch.ps1
+index 10fd0a5..5edaf89 100644
+--- a/pc-vr/launch.ps1
++++ b/pc-vr/launch.ps1
+@@ -2285,6 +2285,10 @@ if ($pace -eq "1") { $env:SHADPS4_VR_FASTEST_PACE = "1"; $env:SHADPS4_VR_FPS_CAP
+ if ((Setting "headset" "1") -eq "0") { $env:SHADPS4_OPENXR = "0" }
+ if ((Setting "pause" "1") -eq "0") { $env:SHADPS4_XR_PAUSE = "0" }
+ $env:SHADPS4_XR_WAIT = Setting "wait" "60"
++# perf_trace=1: the emulator writes a per-frame performance trace (perf_frames.csv and
++# perf_headset.csv in user\log); tools\perf-report.py sums it up.
++$perfTrace = (Setting "perf_trace" "0") -eq "1"
++if ($perfTrace) { $env:SHADPS4_PERF_TRACE = "1" }
+ foreach ($pair in $extraEnv) {
+     $at = $pair.IndexOf("=")
+     if ($at -ge 1) { Set-Item -Path ("Env:" + $pair.Substring(0, $at)) -Value $pair.Substring($at + 1) }
+@@ -2470,6 +2474,9 @@ while (-not $process.HasExited) {
+ }
+ Show-Log
+ Say ""
++if ($perfTrace -and (Test-Path (Join-Path $logDir "perf_frames.csv"))) {
++    Say ("Performance trace: " + (Join-Path $logDir "perf_frames.csv") + " and perf_headset.csv")
++}
+ if ($null -ne $process.ExitCode -and $process.ExitCode -ne 0) {
+     Say ("The emulator ended with code " + $process.ExitCode + ". Its log is $log") "Yellow"
+     if ($memoryShort -and ((Get-Date) - $startedAt).TotalSeconds -lt 30) {
+diff --git a/pc-vr/settings.txt b/pc-vr/settings.txt
+index dca9ec1..aea5d59 100644
+--- a/pc-vr/settings.txt
++++ b/pc-vr/settings.txt
+@@ -146,6 +146,13 @@
+ #move_reach=55
+ #move_turn=65
+ 
++# 1: a performance trace, for finding out what holds the frame rate back. The emulator writes
++# perf_frames.csv (a row for every frame the game shows: its time, the GPU's, shader compiles,
++# waits) and perf_headset.csv (a row for every refresh of the headset: new frame or repeated)
++# into pc-vr\user\log, overwritten at each start. Costs next to nothing; the log can stay off.
++# tools\perf-report.py in the source folder sums them up.
++#perf_trace=0
++
+ # Extra environment variables for the emulator, as many lines as needed.
+ #env=NAME=value
+ eye_width=1152
+diff --git a/shadps4-arm64-main/CMakeLists.txt b/shadps4-arm64-main/CMakeLists.txt
+index 85a2127..7f039ff 100644
+--- a/shadps4-arm64-main/CMakeLists.txt
++++ b/shadps4-arm64-main/CMakeLists.txt
+@@ -873,6 +873,8 @@ set(COMMON src/common/logging/classes.h
+            src/common/native_clock.h
+            src/common/path_util.cpp
+            src/common/path_util.h
++           src/common/perf_trace.cpp
++           src/common/perf_trace.h
+            src/common/object_pool.h
+            src/common/polyfill_thread.h
+            src/common/range_lock.h
+diff --git a/shadps4-arm64-main/src/common/perf_trace.cpp b/shadps4-arm64-main/src/common/perf_trace.cpp
+new file mode 100644
+index 0000000..570d00b
+--- /dev/null
++++ b/shadps4-arm64-main/src/common/perf_trace.cpp
+@@ -0,0 +1,270 @@
++// SPDX-FileCopyrightText: Copyright 2026 shadPS4 Emulator Project
++// SPDX-License-Identifier: GPL-2.0-or-later
++
++#include <array>
++#include <atomic>
++#include <chrono>
++#include <cstdio>
++#include <cstdlib>
++#include <cstring>
++#include <ctime>
++#include <filesystem>
++#include <mutex>
++#include <string>
++#include <thread>
++
++#ifdef _WIN32
++#ifndef NOMINMAX
++#define NOMINMAX
++#endif
++#ifndef WIN32_LEAN_AND_MEAN
++#define WIN32_LEAN_AND_MEAN
++#endif
++#include <windows.h>
++#else
++#include <time.h>
++#endif
++
++#include "common/path_util.h"
++#include "common/perf_trace.h"
++#include "common/rdtsc.h"
++
++#ifndef _WIN32
++extern char** environ;
++#endif
++
++namespace Common::PerfTrace {
++
++namespace {
++
++using Clock = std::chrono::steady_clock;
++
++constexpr size_t NumTimes = static_cast<size_t>(Time::Count);
++constexpr size_t NumCounts = static_cast<size_t>(Count::Count);
++
++constexpr const char* TimeColumns[NumTimes] = {
++    "submit_ms",   "catchup_ms",   "gputhread_cpu_ms", "queued_ms",
++    "gpuwait_ms",  "latency_ms",   "gpu_ms",           "gpu_present_ms",
++    "wait_throttle_ms", "wait_result_ms", "shader_ms", "pipeline_ms",
++};
++constexpr const char* CountColumns[NumCounts] = {
++    "shaders", "pipelines", "passes", "draws", "dispatches", "submits", "gpu_timed",
++};
++
++std::array<std::atomic<u64>, NumTimes> g_times{};
++std::array<std::atomic<u64>, NumCounts> g_counts{};
++
++/// One CSV file, opened the first time a row is written to it.
++class CsvFile {
++public:
++    explicit CsvFile(const char* name_) : name{name_} {}
++
++    ~CsvFile() {
++        std::scoped_lock lock{mutex};
++        if (file != nullptr) {
++            std::fclose(file);
++        }
++    }
++
++    /// Calls `write(FILE*)` for a row, under the file's lock. `header(FILE*)` writes the
++    /// lines at the top the first time.
++    template <typename Header, typename Write>
++    void Row(Header&& header, Write&& write) {
++        std::scoped_lock lock{mutex};
++        if (failed) {
++            return;
++        }
++        if (file == nullptr && !Open(header)) {
++            return;
++        }
++        write(file);
++        // Buffered, but never more than about two seconds behind (in case the emulator is
++        // closed without its destructors running).
++        const auto now = Clock::now();
++        if (now - last_flush > std::chrono::seconds{2}) {
++            std::fflush(file);
++            last_flush = now;
++        }
++    }
++
++private:
++    template <typename Header>
++    bool Open(Header&& header) {
++        std::error_code error;
++        const auto dir = Common::FS::GetUserPath(Common::FS::PathType::LogDir);
++        std::filesystem::create_directories(dir, error);
++        const auto path = dir / name;
++#ifdef _WIN32
++        file = _wfopen(path.c_str(), L"w");
++#else
++        file = std::fopen(path.c_str(), "w");
++#endif
++        if (file == nullptr) {
++            failed = true;
++            return false;
++        }
++        std::setvbuf(file, nullptr, _IOFBF, 1 << 16);
++        header(file);
++        last_flush = Clock::now();
++        return true;
++    }
++
++    const char* name;
++    std::mutex mutex;
++    std::FILE* file{};
++    bool failed{};
++    Clock::time_point last_flush{};
++};
++
++CsvFile g_frames_file{"perf_frames.csv"};
++CsvFile g_headset_file{"perf_headset.csv"};
++
++const Clock::time_point g_start = Clock::now();
++
++double SecondsSinceStart(Clock::time_point now) {
++    return std::chrono::duration<double>(now - g_start).count();
++}
++
++/// The settings the emulator was started with that matter for performance: every SHADPS4_
++/// variable, as a comment line.
++void WriteEnvironment(std::FILE* file) {
++#ifdef _WIN32
++    char** env = _environ;
++#else
++    char** env = environ;
++#endif
++    std::fputs("# environment:", file);
++    for (; env != nullptr && *env != nullptr; ++env) {
++        if (std::strncmp(*env, "SHADPS4_", 8) == 0) {
++            std::fprintf(file, " %s", *env);
++        }
++    }
++    std::fputc('\n', file);
++}
++
++void WriteStarted(std::FILE* file, const char* what) {
++    const std::time_t now = std::time(nullptr);
++    char when[64]{};
++    std::strftime(when, sizeof(when), "%Y-%m-%d %H:%M:%S", std::localtime(&now));
++    std::fprintf(file, "# RushVR performance trace (%s), started %s\n", what, when);
++    WriteEnvironment(file);
++}
++
++} // namespace
++
++bool Enabled() {
++    static const bool enabled = [] {
++        const char* value = std::getenv("SHADPS4_PERF_TRACE");
++        return value != nullptr && *value != '\0' && std::strcmp(value, "0") != 0;
++    }();
++    return enabled;
++}
++
++void Add(Time what, std::chrono::nanoseconds time) {
++    if (!Enabled() || time.count() <= 0) {
++        return;
++    }
++    g_times[static_cast<size_t>(what)].fetch_add(static_cast<u64>(time.count()),
++                                                 std::memory_order_relaxed);
++}
++
++void Add(Count what, u64 amount) {
++    if (!Enabled()) {
++        return;
++    }
++    g_counts[static_cast<size_t>(what)].fetch_add(amount, std::memory_order_relaxed);
++}
++
++void EndFrame() {
++    if (!Enabled()) {
++        return;
++    }
++    static u64 frame = 0;
++    static Clock::time_point last;
++    const auto now = Clock::now();
++    const double frame_ms =
++        last == Clock::time_point{} ? 0.0
++                                    : std::chrono::duration<double, std::milli>(now - last).count();
++    last = now;
++
++    std::array<u64, NumTimes> times;
++    for (size_t i = 0; i < NumTimes; ++i) {
++        times[i] = g_times[i].exchange(0, std::memory_order_relaxed);
++    }
++    std::array<u64, NumCounts> counts;
++    for (size_t i = 0; i < NumCounts; ++i) {
++        counts[i] = g_counts[i].exchange(0, std::memory_order_relaxed);
++    }
++
++    g_frames_file.Row(
++        [](std::FILE* file) {
++            WriteStarted(file, "one row per frame the title presents");
++            std::fputs("# GPU times come from timestamps read back once the GPU has finished, "
++                       "so they lag their frame by one to three rows.\n",
++                       file);
++            std::fputs("frame,t_s,frame_ms", file);
++            for (const char* column : TimeColumns) {
++                std::fprintf(file, ",%s", column);
++            }
++            for (const char* column : CountColumns) {
++                std::fprintf(file, ",%s", column);
++            }
++            std::fputc('\n', file);
++        },
++        [&](std::FILE* file) {
++            std::fprintf(file, "%llu,%.4f,%.3f", static_cast<unsigned long long>(frame),
++                         SecondsSinceStart(now), frame_ms);
++            for (const u64 ns : times) {
++                std::fprintf(file, ",%.3f", static_cast<double>(ns) / 1e6);
++            }
++            for (const u64 count : counts) {
++                std::fprintf(file, ",%llu", static_cast<unsigned long long>(count));
++            }
++            std::fputc('\n', file);
++        });
++    ++frame;
++}
++
++void Headset(const HeadsetRefresh& refresh) {
++    if (!Enabled()) {
++        return;
++    }
++    const auto now = Clock::now();
++    g_headset_file.Row(
++        [](std::FILE* file) {
++            WriteStarted(file, "one row per refresh of the headset's display");
++            std::fputs("t_s,interval_ms,wait_ms,copy_ms,end_ms,display_hz,new_frame,shown\n",
++                       file);
++        },
++        [&](std::FILE* file) {
++            std::fprintf(file, "%.4f,%.3f,%.3f,%.3f,%.3f,%.1f,%d,%d\n", SecondsSinceStart(now),
++                         refresh.interval_ms, refresh.wait_ms, refresh.copy_ms, refresh.end_ms,
++                         refresh.display_hz, refresh.new_frame ? 1 : 0, refresh.shown ? 1 : 0);
++        });
++}
++
++std::chrono::nanoseconds ThreadCpuTime() {
++#ifdef _WIN32
++    // GetThreadTimes only moves on in steps of the scheduler's tick (about 15.6 ms), far too
++    // coarse for a frame. The thread's cycle count is exact; it counts at the rate of the
++    // processor's time stamp counter, which is measured once, off this thread.
++    static std::atomic<u64> tsc_hz{0};
++    static std::once_flag measure;
++    std::call_once(measure, [] {
++        std::thread([] { tsc_hz.store(Common::EstimateRDTSCFrequency()); }).detach();
++    });
++    const u64 hz = tsc_hz.load(std::memory_order_relaxed);
++    ULONG64 cycles = 0;
++    if (hz == 0 || !QueryThreadCycleTime(GetCurrentThread(), &cycles)) {
++        return std::chrono::nanoseconds{0};
++    }
++    return std::chrono::nanoseconds{
++        static_cast<s64>(static_cast<double>(cycles) * 1e9 / static_cast<double>(hz))};
++#else
++    timespec time{};
++    clock_gettime(CLOCK_THREAD_CPUTIME_ID, &time);
++    return std::chrono::seconds{time.tv_sec} + std::chrono::nanoseconds{time.tv_nsec};
++#endif
++}
++
++} // namespace Common::PerfTrace
+diff --git a/shadps4-arm64-main/src/common/perf_trace.h b/shadps4-arm64-main/src/common/perf_trace.h
+new file mode 100644
+index 0000000..baa9c70
+--- /dev/null
++++ b/shadps4-arm64-main/src/common/perf_trace.h
+@@ -0,0 +1,76 @@
++// SPDX-FileCopyrightText: Copyright 2026 shadPS4 Emulator Project
++// SPDX-License-Identifier: GPL-2.0-or-later
++
++#pragma once
++
++#include <chrono>
++#include "common/types.h"
++
++/// A per-frame performance trace, for finding out what holds a title's frame rate back.
++///
++/// SHADPS4_PERF_TRACE=1 writes two CSV files into the log folder, independently of the log
++/// itself (which can stay off):
++///   perf_frames.csv   one row for every frame the title presents: how long the frame took, the
++///                     time spent in each part of its way to the display, the GPU time its work
++///                     took, waits for the GPU, and the shaders and pipelines compiled for it.
++///   perf_headset.csv  one row for every refresh of the headset's display: whether it got a new
++///                     frame from the title or showed the last one again, and what it cost.
++/// tools/perf-report.py turns them into a summary. Without the variable nothing is recorded
++/// and every hook below returns at once.
++namespace Common::PerfTrace {
++
++/// True when SHADPS4_PERF_TRACE is set (and not "0").
++bool Enabled();
++
++/// Times summed per frame, in the order of the columns of perf_frames.csv.
++enum class Time : u32 {
++    Submitting,     ///< The title building the frame: first command list until the flip request.
++    CatchUp,        ///< From there until the GPU thread had translated all of it.
++    GpuThreadCpu,   ///< Processor time the GPU thread spent translating the frame.
++    Queued,         ///< Frame ready until a display refresh took it up.
++    GpuWait,        ///< From there until the GPU had finished drawing it.
++    Latency,        ///< First command list of the frame until its flip.
++    GpuTitle,       ///< GPU time of the title's work (and the VR post-processing).
++    GpuPresent,     ///< GPU time of putting frames on the window.
++    WaitThrottle,   ///< Emulator threads blocked because 8 submissions were in flight.
++    WaitResult,     ///< Emulator threads blocked waiting for a GPU result (readbacks, Finish).
++    ShaderCompile,  ///< Translating guest shaders to SPIR-V and making modules of them.
++    PipelineCompile,///< The driver building pipelines from those modules.
++    Count,
++};
++
++/// Counts per frame, after the times in perf_frames.csv.
++enum class Count : u32 {
++    Shaders,
++    Pipelines,
++    Passes,
++    Draws,
++    Dispatches,
++    Submits,
++    GpuTimed, ///< Submissions whose GPU time is in GpuTitle/GpuPresent this frame.
++    Count,
++};
++
++void Add(Time what, std::chrono::nanoseconds time);
++void Add(Count what, u64 amount = 1);
++
++/// The title presented a frame: writes its row and starts the next.
++void EndFrame();
++
++/// One refresh of the headset's display (from the OpenXR thread).
++struct HeadsetRefresh {
++    double interval_ms;   ///< Since the previous refresh.
++    double wait_ms;       ///< Spent in xrWaitFrame.
++    double copy_ms;       ///< Handing a new frame over (0 when there was none).
++    double end_ms;        ///< Spent in xrEndFrame.
++    float display_hz;     ///< The rate the runtime says its display runs at.
++    bool new_frame;       ///< A frame of the title's that had not been shown yet.
++    bool shown;           ///< Something was shown at all (the runtime wanted it and had a frame).
++};
++void Headset(const HeadsetRefresh& refresh);
++
++/// Processor time the calling thread has used so far (Windows: from its cycle count; 0 for the
++/// first tenth of a second while the counter's frequency is measured).
++std::chrono::nanoseconds ThreadCpuTime();
++
++} // namespace Common::PerfTrace
+diff --git a/shadps4-arm64-main/src/core/vr/openxr_host.cpp b/shadps4-arm64-main/src/core/vr/openxr_host.cpp
+index 39f1b03..9a27d30 100644
+--- a/shadps4-arm64-main/src/core/vr/openxr_host.cpp
++++ b/shadps4-arm64-main/src/core/vr/openxr_host.cpp
+@@ -24,6 +24,7 @@
+ #include <SDL3/SDL_events.h>
+ 
+ #include "common/logging/log.h"
++#include "common/perf_trace.h"
+ #include "common/polyfill_thread.h"
+ #include "common/singleton.h"
+ #include "common/thread.h"
+@@ -1210,6 +1211,7 @@ struct OpenXrHost::Impl {
+             }
+ 
+             XrFrameState frame_state{XR_TYPE_FRAME_STATE};
++            const auto wait_started = Clock::now();
+             if (const XrResult waited = xrWaitFrame(session, nullptr, &frame_state);
+                 XR_FAILED(waited)) {
+                 NoteFrameFailure("xrWaitFrame", waited);
+@@ -1269,11 +1271,17 @@ struct OpenXrHost::Impl {
+                 UpdatePad(pose_time);
+             }
+ 
++            bool perf_new_frame = false;
++            double perf_copy_ms = 0.0;
+             if (const s32 index = TakeFrame(); index >= 0) {
+                 const auto started = Clock::now();
+                 bool blank = false;
+                 const bool copied = CopyFrame(static_cast<u32>(index), blank);
+-                copy_time += std::chrono::duration<double>(Clock::now() - started).count();
++                const double copy_took =
++                    std::chrono::duration<double>(Clock::now() - started).count();
++                copy_time += copy_took;
++                perf_new_frame = copied;
++                perf_copy_ms = copy_took * 1e3;
+                 std::scoped_lock lock{slot_mutex};
+                 Slot& slot = slots[index];
+                 if (copied) {
+@@ -1320,6 +1328,26 @@ struct OpenXrHost::Impl {
+             const double took = std::chrono::duration<double>(Clock::now() - ending).count();
+             end_frame_time += took;
+             end_frame_worst = std::max(end_frame_worst, took);
++            if (Common::PerfTrace::Enabled()) {
++                // One row a refresh: whether it brought a new frame of the title's, which is
++                // what shows judder (an uneven run of new and repeated frames).
++                static Clock::time_point perf_last_woke{};
++                const double interval_ms =
++                    perf_last_woke == Clock::time_point{}
++                        ? 0.0
++                        : std::chrono::duration<double, std::milli>(woke - perf_last_woke).count();
++                perf_last_woke = woke;
++                Common::PerfTrace::Headset({
++                    .interval_ms = interval_ms,
++                    .wait_ms = std::chrono::duration<double, std::milli>(woke - wait_started)
++                                   .count(),
++                    .copy_ms = perf_copy_ms,
++                    .end_ms = took * 1e3,
++                    .display_hz = rate > 30.0f ? rate : refresh_rate,
++                    .new_frame = perf_new_frame,
++                    .shown = layer_count != 0,
++                });
++            }
+             if (layer_count != 0) {
+                 // How far the head has turned from where the picture being shown was drawn
+                 // for: what the compositor makes up for. Next to nothing while the head rests.
+diff --git a/shadps4-arm64-main/src/video_core/renderer_vulkan/vk_instance.h b/shadps4-arm64-main/src/video_core/renderer_vulkan/vk_instance.h
+index 96b5592..05d8312 100644
+--- a/shadps4-arm64-main/src/video_core/renderer_vulkan/vk_instance.h
++++ b/shadps4-arm64-main/src/video_core/renderer_vulkan/vk_instance.h
+@@ -360,6 +360,11 @@ public:
+         return properties.limits.maxSamplerAnisotropy;
+     }
+ 
++    /// Nanoseconds one tick of a GPU timestamp lasts.
++    float TimestampPeriod() const {
++        return properties.limits.timestampPeriod;
++    }
++
+     /// Returns the maximum number of push descriptors.
+     u32 MaxPushDescriptors() const {
+         return push_descriptor_props.maxPushDescriptors;
+diff --git a/shadps4-arm64-main/src/video_core/renderer_vulkan/vk_pipeline_cache.cpp b/shadps4-arm64-main/src/video_core/renderer_vulkan/vk_pipeline_cache.cpp
+index 6442da8..4afb1a7 100644
+--- a/shadps4-arm64-main/src/video_core/renderer_vulkan/vk_pipeline_cache.cpp
++++ b/shadps4-arm64-main/src/video_core/renderer_vulkan/vk_pipeline_cache.cpp
+@@ -1,12 +1,14 @@
+ // SPDX-FileCopyrightText: Copyright 2024-2026 shadPS4 Emulator Project
+ // SPDX-License-Identifier: GPL-2.0-or-later
+ 
++#include <chrono>
+ #include <exception>
+ #include <ranges>
+ 
+ #include "common/hash.h"
+ #include "common/io_file.h"
+ #include "common/path_util.h"
++#include "common/perf_trace.h"
+ #include "core/debug_state.h"
+ #include "core/emulator_settings.h"
+ #include "shader_recompiler/backend/spirv/emit_spirv.h"
+@@ -29,6 +31,34 @@ using Shader::LogicalStage;
+ using Shader::Output;
+ using Shader::Stage;
+ 
++namespace {
++/// Adds the time from its making to its end to a column of the performance trace
++/// (SHADPS4_PERF_TRACE), and one to a count. Does nothing while the trace is off.
++class CompileTimer {
++public:
++    CompileTimer(Common::PerfTrace::Time column_, Common::PerfTrace::Count count_)
++        : column{column_}, count{count_}, on{Common::PerfTrace::Enabled()} {
++        if (on) {
++            start = std::chrono::steady_clock::now();
++        }
++    }
++    ~CompileTimer() {
++        if (on) {
++            Common::PerfTrace::Add(column, std::chrono::steady_clock::now() - start);
++            Common::PerfTrace::Add(count);
++        }
++    }
++    CompileTimer(const CompileTimer&) = delete;
++    CompileTimer& operator=(const CompileTimer&) = delete;
++
++private:
++    Common::PerfTrace::Time column;
++    Common::PerfTrace::Count count;
++    bool on;
++    std::chrono::steady_clock::time_point start{};
++};
++} // namespace
++
+ constexpr static auto SpirvVersion1_6 = 0x00010600U;
+ 
+ constexpr static std::array DescriptorHeapSizes = {
+@@ -337,6 +367,8 @@ const GraphicsPipeline* PipelineCache::GetGraphicsPipeline() {
+     }
+     const auto [it, is_new] = graphics_pipelines.try_emplace(graphics_key);
+     if (is_new) {
++        const CompileTimer timer{Common::PerfTrace::Time::PipelineCompile,
++                                 Common::PerfTrace::Count::Pipelines};
+         const auto pipeline_hash = std::hash<GraphicsPipelineKey>{}(graphics_key);
+         LOG_INFO(Render_Vulkan, "Compiling graphics pipeline {:#x}", pipeline_hash);
+ 
+@@ -386,6 +418,8 @@ const ComputePipeline* PipelineCache::GetComputePipeline() {
+     }
+     const auto [it, is_new] = compute_pipelines.try_emplace(compute_key);
+     if (is_new) {
++        const CompileTimer timer{Common::PerfTrace::Time::PipelineCompile,
++                                 Common::PerfTrace::Count::Pipelines};
+         const auto pipeline_hash = std::hash<ComputePipelineKey>{}(compute_key);
+         LOG_INFO(Render_Vulkan, "Compiling compute pipeline {:#x}", pipeline_hash);
+ 
+@@ -637,6 +671,8 @@ bool PipelineCache::RefreshComputeKey() {
+ vk::ShaderModule PipelineCache::CompileModule(Shader::Info& info, Shader::RuntimeInfo& runtime_info,
+                                               const std::span<const u32>& code, size_t perm_idx,
+                                               Shader::Backend::Bindings& binding) {
++    const CompileTimer timer{Common::PerfTrace::Time::ShaderCompile,
++                             Common::PerfTrace::Count::Shaders};
+     LOG_INFO(Render_Vulkan, "Compiling {} shader {:#x} {}", info.stage, info.pgm_hash,
+              perm_idx != 0 ? "(permutation)" : "");
+     DumpShader(code, info.pgm_hash, info.stage, perm_idx, "bin");
+diff --git a/shadps4-arm64-main/src/video_core/renderer_vulkan/vk_presenter.cpp b/shadps4-arm64-main/src/video_core/renderer_vulkan/vk_presenter.cpp
+index 2194243..e8dc72c 100644
+--- a/shadps4-arm64-main/src/video_core/renderer_vulkan/vk_presenter.cpp
++++ b/shadps4-arm64-main/src/video_core/renderer_vulkan/vk_presenter.cpp
+@@ -509,6 +509,9 @@ Presenter::Presenter(Frontend::WindowSDL& window_, AmdGpu::Liverpool* liverpool_
+       texture_cache{rasterizer->GetTextureCache()} {
+     const u32 num_images = swapchain.GetImageCount();
+     const vk::Device device = instance.GetDevice();
++    // (For the performance trace: the window's work is counted apart from the title's.)
++    present_scheduler.SetPerfRole(Scheduler::PerfRole::Present);
++    flip_scheduler.SetPerfRole(Scheduler::PerfRole::Present);
+ 
+     // Create presentation frames.
+     present_frames.resize(num_images);
+diff --git a/shadps4-arm64-main/src/video_core/renderer_vulkan/vk_scheduler.cpp b/shadps4-arm64-main/src/video_core/renderer_vulkan/vk_scheduler.cpp
+index fb9615d..069bd7b 100644
+--- a/shadps4-arm64-main/src/video_core/renderer_vulkan/vk_scheduler.cpp
++++ b/shadps4-arm64-main/src/video_core/renderer_vulkan/vk_scheduler.cpp
+@@ -19,6 +19,7 @@
+ #include "common/assert.h"
+ #include "common/debug.h"
+ #include "common/logging/log.h"
++#include "common/perf_trace.h"
+ #include "common/thread.h"
+ #include "core/guest_cpu/guest_wait_trace.h"
+ #include "imgui/renderer/texture_manager.h"
+@@ -164,7 +165,8 @@ const char* FileName(const char* path) {
+ } // namespace
+ 
+ bool FrameStats::Enabled() {
+-    return FrameStatsLevel() > 0;
++    // The per-frame trace (SHADPS4_PERF_TRACE) takes its figures from the same places.
++    return FrameStatsLevel() > 0 || Common::PerfTrace::Enabled();
+ }
+ 
+ void FrameStats::RenderPass(const RenderState& state) {
+@@ -199,6 +201,7 @@ void FrameStats::RenderPass(const RenderState& state) {
+     }
+ 
+     const bool has_targets = record.color_view != 0 || record.depth;
++    Common::PerfTrace::Add(Common::PerfTrace::Count::Passes);
+     g_frame_counters.passes.Add();
+     g_frame_counters.loading_passes.Add(record.loaded_colors != 0 || record.depth_loaded ? 1 : 0);
+     // A pass without targets is as large as a framebuffer may be, and costs nothing.
+@@ -228,6 +231,7 @@ void FrameStats::Draw() {
+     if (!Enabled()) {
+         return;
+     }
++    Common::PerfTrace::Add(Common::PerfTrace::Count::Draws);
+     g_frame_counters.draws.Add();
+     if (FrameStatsLevel() > 1) {
+         std::scoped_lock lock{g_frame_listing.mutex};
+@@ -243,7 +247,8 @@ std::map<u64, u64> g_viewport_sizes; // (width << 32 | height) -> draws
+ } // namespace
+ 
+ void FrameStats::Viewport(u32 width, u32 height) {
+-    if (!Enabled()) {
++    // (Only for the log's listing: a lock and a map for every draw is not for the trace.)
++    if (FrameStatsLevel() <= 0) {
+         return;
+     }
+     std::scoped_lock lock{g_viewport_mutex};
+@@ -252,12 +257,14 @@ void FrameStats::Viewport(u32 width, u32 height) {
+ 
+ void FrameStats::Compute() {
+     if (Enabled()) {
++        Common::PerfTrace::Add(Common::PerfTrace::Count::Dispatches);
+         g_frame_counters.computes.Add();
+     }
+ }
+ 
+ void FrameStats::Submit() {
+     if (Enabled()) {
++        Common::PerfTrace::Add(Common::PerfTrace::Count::Submits);
+         g_frame_counters.submits.Add();
+     }
+ }
+@@ -266,6 +273,10 @@ void FrameStats::Time(Stage stage, std::chrono::nanoseconds time) {
+     if (Enabled() && time.count() >= 0) {
+         g_stage_times.total[static_cast<size_t>(stage)] += static_cast<u64>(time.count());
+         ++g_stage_times.count[static_cast<size_t>(stage)];
++        // The stages are the first columns of the trace, in the same order.
++        static_assert(static_cast<u32>(Stage::Latency) ==
++                      static_cast<u32>(Common::PerfTrace::Time::Latency));
++        Common::PerfTrace::Add(static_cast<Common::PerfTrace::Time>(stage), time);
+     }
+ }
+ 
+@@ -317,7 +328,7 @@ float FrameStats::TakeGpuLoad() {
+ 
+ std::chrono::nanoseconds FrameStats::ThreadTime() {
+ #ifdef _WIN32
+-    return std::chrono::nanoseconds{0};
++    return Common::PerfTrace::ThreadCpuTime();
+ #else
+     timespec time{};
+     clock_gettime(CLOCK_THREAD_CPUTIME_ID, &time);
+@@ -329,6 +340,11 @@ void FrameStats::EndFrame() {
+     if (!Enabled()) {
+         return;
+     }
++    Common::PerfTrace::EndFrame();
++    if (FrameStatsLevel() <= 0) {
++        // Only the trace is on: the log's averages are not wanted.
++        return;
++    }
+     auto& c = g_frame_counters;
+     const u64 frames = ++c.frames;
+ 
+@@ -464,6 +480,7 @@ Scheduler::Scheduler(const Instance& instance)
+ #if TRACY_GPU_ENABLED
+     profiler_scope = reinterpret_cast<tracy::VkCtxScope*>(std::malloc(sizeof(tracy::VkCtxScope)));
+ #endif
++    CreateGpuTimer();
+     AllocateWorkerCommandBuffers();
+     priority_pending_ops_thread =
+         std::jthread(std::bind_front(&Scheduler::PriorityPendingOpsThread, this));
+@@ -473,6 +490,9 @@ Scheduler::~Scheduler() {
+ #if TRACY_GPU_ENABLED
+     std::free(profiler_scope);
+ #endif
++    if (gpu_timer.pool) {
++        instance.GetDevice().destroyQueryPool(gpu_timer.pool);
++    }
+ }
+ 
+ /// Whether a pass begun with `current` can take a draw that asks for `next`: the same targets in
+@@ -617,11 +637,11 @@ void Scheduler::Wait(u64 tick) {
+         Flush(info);
+     }
+     if (timed) {
+-        g_wait_times.explicit_ns += static_cast<u64>(
+-            std::chrono::duration_cast<std::chrono::nanoseconds>(
+-                std::chrono::steady_clock::now() - wait_start)
+-                .count());
++        const auto waited = std::chrono::duration_cast<std::chrono::nanoseconds>(
++            std::chrono::steady_clock::now() - wait_start);
++        g_wait_times.explicit_ns += static_cast<u64>(waited.count());
+         ++g_wait_times.explicit_count;
++        Common::PerfTrace::Add(Common::PerfTrace::Time::WaitResult, waited);
+     }
+ }
+ 
+@@ -642,6 +662,7 @@ void Scheduler::AllocateWorkerCommandBuffers() {
+ 
+     current_cmdbuf = command_pool.Commit();
+     Check(current_cmdbuf.begin(begin_info));
++    StartGpuTimer();
+ 
+     // Invalidate dynamic state so it gets applied to the new command buffer.
+     dynamic_state.Invalidate();
+@@ -657,6 +678,90 @@ void Scheduler::AllocateWorkerCommandBuffers() {
+ #endif
+ }
+ 
++void Scheduler::CreateGpuTimer() {
++    if (!Common::PerfTrace::Enabled()) {
++        return;
++    }
++    const auto families = instance.GetPhysicalDevice().getQueueFamilyProperties();
++    const u32 family = instance.GetGraphicsQueueFamilyIndex();
++    const u32 bits = family < families.size() ? families[family].timestampValidBits : 0;
++    if (bits == 0) {
++        LOG_WARNING(Render_Vulkan, "Performance trace: this GPU's queue has no timestamps, "
++                                   "GPU times are left out");
++        return;
++    }
++    const auto created = instance.GetDevice().createQueryPool(vk::QueryPoolCreateInfo{
++        .queryType = vk::QueryType::eTimestamp,
++        .queryCount = GpuTimerSlots * 2,
++    });
++    if (created.result != vk::Result::eSuccess) {
++        LOG_WARNING(Render_Vulkan, "Performance trace: no timestamp query pool ({}), GPU times "
++                                   "are left out",
++                    vk::to_string(created.result));
++        return;
++    }
++    gpu_timer.pool = created.value;
++    gpu_timer.ns_per_tick = static_cast<double>(instance.TimestampPeriod());
++    gpu_timer.valid_mask = bits >= 64 ? ~u64{0} : (u64{1} << bits) - 1;
++}
++
++void Scheduler::StartGpuTimer() {
++    if (!gpu_timer.pool) {
++        return;
++    }
++    // The ring is long enough for the oldest pair to be long finished by the time it comes
++    // round again (at most MAX_IN_FLIGHT_SUBMISSIONS are in flight); one not read back by then
++    // is given up.
++    if (gpu_timer.pending.size() >= GpuTimerSlots - 1) {
++        gpu_timer.pending.pop_front();
++    }
++    const u32 slot = gpu_timer.next;
++    gpu_timer.next = (slot + 1) % GpuTimerSlots;
++    current_cmdbuf.resetQueryPool(gpu_timer.pool, slot * 2, 2);
++    current_cmdbuf.writeTimestamp(vk::PipelineStageFlagBits::eTopOfPipe, gpu_timer.pool,
++                                  slot * 2);
++    gpu_timer.open = static_cast<s32>(slot);
++}
++
++void Scheduler::StopGpuTimer(u64 tick) {
++    if (!gpu_timer.pool || gpu_timer.open < 0) {
++        return;
++    }
++    const u32 slot = static_cast<u32>(gpu_timer.open);
++    current_cmdbuf.writeTimestamp(vk::PipelineStageFlagBits::eBottomOfPipe, gpu_timer.pool,
++                                  slot * 2 + 1);
++    gpu_timer.pending.push_back({slot, tick});
++    gpu_timer.open = -1;
++}
++
++void Scheduler::CollectGpuTimes() {
++    if (!gpu_timer.pool) {
++        return;
++    }
++    const auto column = perf_role == PerfRole::Title ? Common::PerfTrace::Time::GpuTitle
++                                                     : Common::PerfTrace::Time::GpuPresent;
++    // Only what the GPU is already known to have finished: asking it costs nothing then.
++    while (!gpu_timer.pending.empty() &&
++           master_semaphore.IsFree(gpu_timer.pending.front().tick)) {
++        const auto pending = gpu_timer.pending.front();
++        std::array<u64, 2> stamps{};
++        const vk::Result result = instance.GetDevice().getQueryPoolResults(
++            gpu_timer.pool, pending.slot * 2, 2, sizeof(stamps), stamps.data(), sizeof(u64),
++            vk::QueryResultFlagBits::e64);
++        if (result == vk::Result::eNotReady) {
++            break;
++        }
++        gpu_timer.pending.pop_front();
++        if (result != vk::Result::eSuccess) {
++            continue;
++        }
++        const u64 ticks = (stamps[1] - stamps[0]) & gpu_timer.valid_mask;
++        Common::PerfTrace::Add(column, std::chrono::nanoseconds{static_cast<s64>(
++                                           static_cast<double>(ticks) * gpu_timer.ns_per_tick)});
++        Common::PerfTrace::Add(Common::PerfTrace::Count::GpuTimed);
++    }
++}
++
+ bool IsSyncTraceEnabled() {
+     static const bool enabled = std::getenv("SHADPS4_TRACE_SYNC") != nullptr;
+     return enabled;
+@@ -685,11 +790,11 @@ void Scheduler::SubmitExecution(SubmitInfo& info) {
+                                       : std::chrono::steady_clock::time_point{};
+         master_semaphore.Wait(signal_value - MAX_IN_FLIGHT_SUBMISSIONS);
+         if (timed) {
+-            g_wait_times.throttle_ns += static_cast<u64>(
+-                std::chrono::duration_cast<std::chrono::nanoseconds>(
+-                    std::chrono::steady_clock::now() - wait_start)
+-                    .count());
++            const auto waited = std::chrono::duration_cast<std::chrono::nanoseconds>(
++                std::chrono::steady_clock::now() - wait_start);
++            g_wait_times.throttle_ns += static_cast<u64>(waited.count());
+             ++g_wait_times.throttle_count;
++            Common::PerfTrace::Add(Common::PerfTrace::Time::WaitThrottle, waited);
+         }
+     }
+ 
+@@ -704,6 +809,7 @@ void Scheduler::SubmitExecution(SubmitInfo& info) {
+     EndRendering();
+     draws_since_flush = 0;
+     flush_due = false;
++    StopGpuTimer(signal_value);
+     Check(current_cmdbuf.end());
+ 
+     const vk::Semaphore timeline = master_semaphore.Handle();
+@@ -765,6 +871,7 @@ void Scheduler::SubmitExecution(SubmitInfo& info) {
+                      vk::to_string(submit_result));
+     }
+ 
++    CollectGpuTimes();
+     AllocateWorkerCommandBuffers();
+ 
+     // Apply pending operations
+diff --git a/shadps4-arm64-main/src/video_core/renderer_vulkan/vk_scheduler.h b/shadps4-arm64-main/src/video_core/renderer_vulkan/vk_scheduler.h
+index a7353cf..ab58ce9 100644
+--- a/shadps4-arm64-main/src/video_core/renderer_vulkan/vk_scheduler.h
++++ b/shadps4-arm64-main/src/video_core/renderer_vulkan/vk_scheduler.h
+@@ -5,6 +5,7 @@
+ 
+ #include <chrono>
+ #include <condition_variable>
++#include <deque>
+ #include <mutex>
+ #include <thread>
+ #include <queue>
+@@ -515,9 +516,25 @@ public:
+ 
+     static std::mutex submit_mutex;
+ 
++    /// Which column of the performance trace (SHADPS4_PERF_TRACE) the GPU time of this
++    /// scheduler's submissions goes to.
++    enum class PerfRole : u8 {
++        Title,   ///< What the title draws, and what is done to it on the way to the headset.
++        Present, ///< Putting frames on the window.
++    };
++    void SetPerfRole(PerfRole role) {
++        perf_role = role;
++    }
++
+ private:
+     void AllocateWorkerCommandBuffers();
+ 
++    /// GPU timestamps around every command buffer, for the performance trace only.
++    void CreateGpuTimer();
++    void StartGpuTimer();
++    void StopGpuTimer(u64 tick);
++    void CollectGpuTimes();
++
+     void SubmitExecution(SubmitInfo& info);
+ 
+     void PriorityPendingOpsThread(std::stop_token stoken);
+@@ -546,6 +563,23 @@ private:
+     /// pipelines of its own, always in a pass of its own: nothing is assumed across passes.
+     vk::Pipeline bound_pipeline{};
+     tracy::VkCtxScope* profiler_scope{};
++
++    /// Pairs of timestamps, one pair a command buffer, used round as a ring (guarded by
++    /// submit_mutex, like everything SubmitExecution touches).
++    static constexpr u32 GpuTimerSlots = 256;
++    struct GpuTimer {
++        vk::QueryPool pool{};
++        double ns_per_tick{};
++        u64 valid_mask{};
++        u32 next{};
++        s32 open{-1}; ///< The slot of the command buffer being recorded, if it is timed.
++        struct Pending {
++            u32 slot;
++            u64 tick;
++        };
++        std::deque<Pending> pending;
++    } gpu_timer;
++    PerfRole perf_role{PerfRole::Title};
+ };
+ 
+ } // namespace Vulkan
+diff --git a/tools/perf-report.py b/tools/perf-report.py
+new file mode 100644
+index 0000000..22a093e
+--- /dev/null
++++ b/tools/perf-report.py
+@@ -0,0 +1,308 @@
++#!/usr/bin/env python3
++"""Sums up a performance trace written with perf_trace=1 (SHADPS4_PERF_TRACE=1).
++
++    perf-report.py [log folder or perf_frames.csv] [--skip seconds] [--worst n]
++
++Without a path it reads ..\\pc-vr\\user\\log next to this folder, then pc-vr\\user\\log under the
++current one. It reads perf_frames.csv (one row a frame the game shows) and, where it is there,
++perf_headset.csv (one row a refresh of the headset), and prints:
++  - the frame rate and how steady it is (median, 90th/99th percentile, the longest frames),
++  - where a frame's time goes on average (the game building it, the emulator's GPU thread
++    translating it, the GPU drawing it, waits for the GPU, shader and pipeline compiles),
++  - what the long frames (hitches) had in them,
++  - for the headset: how often a refresh got a new frame, and whether frames were shown for an
++    even number of refreshes (uneven = judder),
++  - the worst seconds of the run,
++  - and a verdict: what most likely holds the frame rate back, and what to try.
++The first --skip seconds (default 15: start-up and loading) are left out.
++"""
++import csv
++import math
++import os
++import statistics
++import sys
++from collections import Counter
++
++
++def read_csv(path):
++    """Rows of a trace file as dicts of floats, and the comment lines at its top."""
++    comments = []
++    with open(path, newline="", encoding="utf-8", errors="replace") as file:
++        lines = []
++        for line in file:
++            if line.startswith("#"):
++                comments.append(line[1:].strip())
++            elif line.strip():
++                lines.append(line)
++    rows = []
++    for row in csv.DictReader(lines):
++        try:
++            rows.append({key: float(value) for key, value in row.items() if key})
++        except (TypeError, ValueError):
++            continue  # a row cut short when the emulator was closed
++    return rows, comments
++
++
++def percentile(values, fraction):
++    if not values:
++        return 0.0
++    ordered = sorted(values)
++    index = min(len(ordered) - 1, max(0, int(math.ceil(fraction * len(ordered))) - 1))
++    return ordered[index]
++
++
++def mean(values):
++    return statistics.fmean(values) if values else 0.0
++
++
++def environment(comments):
++    env = {}
++    for line in comments:
++        if line.startswith("environment:"):
++            for pair in line[len("environment:"):].split():
++                if "=" in pair:
++                    key, value = pair.split("=", 1)
++                    env[key] = value
++    return env
++
++
++def find_folder(argument):
++    if argument:
++        return os.path.dirname(argument) if argument.lower().endswith(".csv") else argument
++    here = os.path.dirname(os.path.abspath(__file__))
++    for candidate in (os.path.join(here, "..", "..", "pc-vr", "user", "log"),
++                      os.path.join(here, "..", "pc-vr", "user", "log"),
++                      os.path.join("pc-vr", "user", "log"), "."):
++        if os.path.exists(os.path.join(candidate, "perf_frames.csv")):
++            return candidate
++    sys.exit("No perf_frames.csv found: give the log folder (pc-vr\\user\\log) or the file.")
++
++
++# Column -> what it is, for the breakdown.
++PARTS = [
++    ("submit_ms", "game building the frame (its own CPU work, up to handing it over)"),
++    ("catchup_ms", "GPU thread still translating after the hand-over"),
++    ("gputhread_cpu_ms", "CPU time of the emulator's GPU thread (translating PS4 commands)"),
++    ("gpu_ms", "GPU time of the game's work (and the VR post-processing)"),
++    ("gpu_present_ms", "GPU time of the window on the PC"),
++    ("queued_ms", "frame ready, waiting for a headset refresh to take it"),
++    ("gpuwait_ms", "waiting for the GPU to finish the frame before it is shown"),
++    ("wait_throttle_ms", "emulator blocked: 8 submissions already in flight (GPU behind)"),
++    ("wait_result_ms", "emulator blocked waiting for a GPU result (readback/sync)"),
++    ("shader_ms", "translating new shaders"),
++    ("pipeline_ms", "driver compiling new pipelines"),
++    ("latency_ms", "first command of the frame until its flip (for reference)"),
++]
++
++
++def report_frames(rows, env, skip, worst):
++    if not rows:
++        print("perf_frames.csv has no rows.")
++        return None
++    start = rows[0]["t_s"] + skip
++    body = [row for row in rows if row["t_s"] >= start and row["frame_ms"] > 0]
++    if len(body) < 30:
++        body = [row for row in rows if row["frame_ms"] > 0]
++        print(f"(The run is short: the first {skip:.0f} s are kept in.)")
++    if not body:
++        print("No frames to look at.")
++        return None
++    duration = body[-1]["t_s"] - body[0]["t_s"] + body[0]["frame_ms"] / 1000.0
++    times = [row["frame_ms"] for row in body]
++    median = statistics.median(times)
++    target = float(env.get("SHADPS4_VR_TARGET_FPS", 0) or 0)
++    budget = 1000.0 / target if target > 0 else median
++
++    print("=== Frames ===")
++    print(f"{len(body)} frames over {duration:.1f} s: {len(body) / duration:.1f} fps on average"
++          + (f" (target {target:.0f}, {budget:.1f} ms a frame)" if target > 0 else ""))
++    print(f"frame time: median {median:.1f} ms, 90% under {percentile(times, 0.9):.1f} ms, "
++          f"99% under {percentile(times, 0.99):.1f} ms, longest {max(times):.1f} ms")
++    long_frames = [row for row in body if row["frame_ms"] > budget * 1.5]
++    print(f"{len(long_frames)} frames ({100.0 * len(long_frames) / len(body):.1f}%) took over "
++          f"1.5x the budget ({budget * 1.5:.1f} ms)")
++
++    print("\n=== Where a frame's time goes (average / 95th percentile, ms) ===")
++    averages = {}
++    for column, meaning in PARTS:
++        if column not in body[0]:
++            continue
++        values = [row[column] for row in body]
++        averages[column] = mean(values)
++        if max(values) <= 0.0:
++            continue
++        print(f"  {column:17} {mean(values):7.2f} / {percentile(values, 0.95):7.2f}   {meaning}")
++    compiles = sum(row.get("shaders", 0) for row in body)
++    pipelines = sum(row.get("pipelines", 0) for row in body)
++    print(f"  draws {mean([r.get('draws', 0) for r in body]):.0f}, passes "
++          f"{mean([r.get('passes', 0) for r in body]):.0f}, submits "
++          f"{mean([r.get('submits', 0) for r in body]):.1f} a frame; {compiles:.0f} shaders and "
++          f"{pipelines:.0f} pipelines compiled in all")
++    if "gpu_timed" in body[0] and sum(r["gpu_timed"] for r in body) == 0:
++        print("  (No GPU times: the GPU's queue gave no timestamps.)")
++
++    print("\n=== Long frames (hitches) ===")
++    if not long_frames:
++        print("  none")
++    else:
++        causes = Counter()
++        for row in long_frames:
++            extra = row["frame_ms"] - budget
++            compile_ms = row.get("shader_ms", 0) + row.get("pipeline_ms", 0)
++            if compile_ms > 0.4 * extra:
++                causes["shader/pipeline compiles"] += 1
++            elif row.get("gpu_ms", 0) > budget:
++                causes["GPU work over budget"] += 1
++            elif row.get("gputhread_cpu_ms", 0) > budget:
++                causes["GPU thread (translation) over budget"] += 1
++            elif row.get("wait_result_ms", 0) > 0.4 * extra:
++                causes["waiting for a GPU result"] += 1
++            elif row.get("submit_ms", 0) > budget:
++                causes["the game's own CPU work"] += 1
++            else:
++                causes["not explained by the trace (game logic, loading, the OS)"] += 1
++        for cause, count in causes.most_common():
++            print(f"  {count:5}  {cause}")
++        print(f"  The {min(worst, len(long_frames))} longest:")
++        for row in sorted(long_frames, key=lambda r: -r["frame_ms"])[:worst]:
++            print(f"    t={row['t_s']:7.1f}s {row['frame_ms']:6.1f} ms: game {row.get('submit_ms', 0):.1f}, "
++                  f"GPU thread {row.get('gputhread_cpu_ms', 0):.1f}, GPU {row.get('gpu_ms', 0):.1f}, "
++                  f"compiles {row.get('shader_ms', 0) + row.get('pipeline_ms', 0):.1f} "
++                  f"({row.get('shaders', 0):.0f}+{row.get('pipelines', 0):.0f}), "
++                  f"result waits {row.get('wait_result_ms', 0):.1f}")
++
++    print("\n=== Worst seconds ===")
++    seconds = {}
++    for row in body:
++        seconds.setdefault(int(row["t_s"]), []).append(row)
++    # (The first and last second are only partly in the run.)
++    whole = {k: v for k, v in seconds.items() if min(seconds) < k < max(seconds)} or seconds
++    ranked = sorted((s for s in whole.items() if len(s[1]) >= 2),
++                    key=lambda s: (len(s[1]), -max(r["frame_ms"] for r in s[1])))
++    for second, frames in ranked[:worst]:
++        print(f"  {second:6} s: {len(frames):3} frames, longest {max(r['frame_ms'] for r in frames):6.1f} ms, "
++              f"GPU {mean([r.get('gpu_ms', 0) for r in frames]):.1f}, "
++              f"GPU thread {mean([r.get('gputhread_cpu_ms', 0) for r in frames]):.1f}, "
++              f"game {mean([r.get('submit_ms', 0) for r in frames]):.1f} ms a frame")
++    return {"budget": budget, "median": median, "averages": averages,
++            "long": len(long_frames), "frames": len(body), "compiles": compiles + pipelines,
++            "fps": len(body) / duration, "target": target}
++
++
++def report_headset(rows, skip):
++    if not rows:
++        return None
++    start = rows[0]["t_s"] + skip
++    body = [row for row in rows if row["t_s"] >= start] or rows
++    shown = [row for row in body if row["shown"]]
++    hz = statistics.median([row["display_hz"] for row in body if row["display_hz"] > 0] or [0])
++    period = 1000.0 / hz if hz > 0 else 0.0
++    new = sum(1 for row in body if row["new_frame"])
++    print("\n=== Headset ===")
++    print(f"{len(body)} refreshes at {hz:.0f} Hz; {new} brought a new frame "
++          f"({new / max(1, len(body)) * hz:.1f} new frames a second), "
++          f"{len(body) - len(shown)} showed nothing")
++    # How many refreshes each frame stayed up: even runs are smooth, a mix is judder.
++    runs = []
++    count = 0
++    for row in body:
++        if row["new_frame"]:
++            if count:
++                runs.append(count)
++            count = 1
++        elif count:
++            count += 1
++    holds = Counter(runs)
++    if holds:
++        usual, usual_count = holds.most_common(1)[0]
++        uneven = 1.0 - usual_count / len(runs)
++        print("frames held for " + ", ".join(f"{n} refresh{'es' if n > 1 else ''}: {c}"
++                                            for n, c in sorted(holds.items())))
++        print(f"{100 * uneven:.1f}% of frames were held for other than the usual {usual} "
++              f"refresh{'es' if usual > 1 else ''}" + ("  <- judder" if uneven > 0.1 else ""))
++    else:
++        uneven = 0.0
++    if period > 0:
++        late = [row for row in body if row["interval_ms"] > period * 1.5]
++        print(f"{len(late)} refreshes came late (over {period * 1.5:.1f} ms apart): the "
++              f"runtime or the PC stalled; xrEndFrame {mean([r['end_ms'] for r in body]):.2f} ms, "
++              f"handing a frame over {mean([r['copy_ms'] for r in body if r['new_frame']]):.2f} ms on average")
++    return {"hz": hz, "uneven": uneven, "new_per_s": new / max(1, len(body)) * hz}
++
++
++def verdict(frames, headset):
++    print("\n=== Verdict ===")
++    if frames is None:
++        return
++    budget = frames["budget"]
++    a = frames["averages"]
++    notes = []
++    gpu = a.get("gpu_ms", 0) + a.get("gpu_present_ms", 0)
++    if gpu > 0.85 * budget:
++        notes.append(f"GPU-bound: the GPU needs {gpu:.1f} ms of the {budget:.1f} ms a frame. Lower "
++                     "eye_width (Medium/Low in the window), layer_scale, fov, aniso or fxaa.")
++    if a.get("gputhread_cpu_ms", 0) > 0.75 * budget:
++        notes.append(f"Emulator-CPU-bound: the GPU thread spends {a['gputhread_cpu_ms']:.1f} ms a frame "
++                     "translating the game's commands. Resolution settings will not help; this "
++                     "needs work in the emulator (or a faster CPU).")
++    if a.get("submit_ms", 0) > 0.75 * budget:
++        notes.append(f"Game-CPU-bound: the game takes {a['submit_ms']:.1f} ms to build a frame. "
++                     "Resolution settings will not help.")
++    if a.get("wait_result_ms", 0) > 0.2 * budget:
++        notes.append(f"The emulator waits {a['wait_result_ms']:.1f} ms a frame for GPU results "
++                     "(readbacks): CPU and GPU take turns instead of working together.")
++    if frames["compiles"] > 0 and frames["long"] > 0:
++        notes.append(f"{frames['compiles']:.0f} shaders/pipelines were compiled during play: if the "
++                     "hitches above are mostly compiles, turn on the pipeline cache "
++                     "(pipeline_cache_enabled in user\\config.json) so later runs reuse them.")
++    if headset is not None and headset["hz"] > 0:
++        fps = frames["fps"]
++        ratio = headset["hz"] / max(fps, 1.0)
++        if headset["uneven"] > 0.1 or abs(ratio - round(ratio)) > 0.15:
++            notes.append(f"Judder: about {fps:.0f} fps on a {headset['hz']:.0f} Hz display is "
++                         f"{ratio:.2f} refreshes a frame. Use a refresh rate that is a whole "
++                         "multiple of the frame rate (120 Hz for 60 fps, 90 Hz for 45).")
++    busiest = max(gpu, a.get("gputhread_cpu_ms", 0), a.get("submit_ms", 0))
++    if not any(n.endswith("bound") or "-bound:" in n for n in notes) and busiest < 0.6 * budget:
++        notes.append(f"Headroom: the busiest part (GPU {gpu:.1f}, GPU thread "
++                     f"{a.get('gputhread_cpu_ms', 0):.1f}, game {a.get('submit_ms', 0):.1f} ms) uses "
++                     f"under 60% of the {budget:.1f} ms budget; a sharper picture (eye_width) is "
++                     "affordable if the GPU figure stays well under the budget.")
++    if not notes:
++        notes.append("Nothing stands out: the frame rate holds and the headset gets frames evenly.")
++    for note in notes:
++        print(" - " + note)
++
++
++def main():
++    args = sys.argv[1:]
++    skip, worst, path = 15.0, 8, None
++    while args:
++        arg = args.pop(0)
++        if arg == "--skip":
++            skip = float(args.pop(0))
++        elif arg == "--worst":
++            worst = int(args.pop(0))
++        elif arg in ("-h", "--help"):
++            print(__doc__)
++            return
++        else:
++            path = arg
++    folder = find_folder(path)
++    frames_rows, comments = read_csv(os.path.join(folder, "perf_frames.csv"))
++    env = environment(comments)
++    for line in comments[:1]:
++        print(line)
++    if env:
++        print("settings: " + " ".join(f"{k}={v}" for k, v in sorted(env.items())))
++    print()
++    frames = report_frames(frames_rows, env, skip, worst)
++    headset_path = os.path.join(folder, "perf_headset.csv")
++    headset = None
++    if os.path.exists(headset_path):
++        headset = report_headset(read_csv(headset_path)[0], skip)
++    verdict(frames, headset)
++
++
++if __name__ == "__main__":
++    main()
+-- 
+2.43.0
+
