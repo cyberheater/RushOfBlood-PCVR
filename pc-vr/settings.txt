@@ -164,7 +164,22 @@
 
 # Extra environment variables for the emulator, as many lines as needed.
 #env=NAME=value
-eye_width=1152
+eye_width=2304
 fps=60
-fov=120
+fov=100
 menu=1
+runtime=pc
+aniso=16
+fxaa=0.65
+mask=0.9
+sharpen=0.3
+layer_scale=50
+target_fps=60
+pc_view=left
+pc_zoom=100
+controllers=quest
+move_pitch=-55
+move_reach=100
+move_turn=100
+black=0.05
+perf_trace=0
