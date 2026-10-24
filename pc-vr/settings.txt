@@ -138,13 +138,14 @@
 #controllers=dualsense
 
 # The Quest controllers as Move wands, set by three sliders in the window: move_pitch, how
-# far the in-game guns are raised above the way the controller points, in degrees (0 to 90);
+# far the in-game guns are tilted from the way the controller's grip is turned, in degrees (-90
+# to 90, below 0 lowers them: a Quest controller's grip leans up from where you point);
 # move_reach, how far the in-game hands move when yours do, in percent of your own movement (5 to
 # 130); and move_turn, how far the guns turn when you turn your wrist, in percent (5 to 130).
 # Used only with controllers=quest. The window's recommended values:
-#move_pitch=35
-#move_reach=55
-#move_turn=65
+#move_pitch=-55
+#move_reach=100
+#move_turn=100
 
 # 1: a performance trace, for finding out what holds the frame rate back. The emulator writes
 # perf_frames.csv (a row for every frame the game shows: its time, the GPU's, shader compiles,
